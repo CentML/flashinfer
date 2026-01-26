@@ -192,6 +192,7 @@ if CUDNN_AVAILABLE:
             else:
                 raise ValueError(f"Invalid query tensor shape: {q.shape}")
 
+            s_stride, h_stride, d_stride = q.stride()
             cudnn_q = g.tensor(
                 name="q",
                 dim=(graph_b, h_qo, graph_s_qo, d_qk),
