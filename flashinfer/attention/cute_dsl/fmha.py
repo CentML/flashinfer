@@ -79,31 +79,27 @@ def _get_checksums(gpu_arch: str) -> dict[str, str]:
     if gpu_arch in _checksums_cache:
         return _checksums_cache[gpu_arch]
 
-    from flashinfer.jit.cubin_loader import download_file, safe_urljoin
-    from flashinfer.jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY
-    from flashinfer.jit.env import FLASHINFER_CUBIN_DIR
+    from flashinfer.artifacts import CheckSumHash
+    from flashinfer.jit.cubin_loader import get_artifact
 
     cpu_arch = _get_cpu_arch()
     checksums_rel = os.path.join(
         DSL_FMHA_ARTIFACT_PATH, cpu_arch, gpu_arch, "checksums.txt"
     )
-    local_path = FLASHINFER_CUBIN_DIR / checksums_rel
-
-    if not local_path.exists():
-        os.makedirs(local_path.parent, exist_ok=True)
-        uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, checksums_rel)
-        logger.info(f"Fetching checksums for {gpu_arch} from {uri}")
-        download_file(uri, str(local_path))
+    data = get_artifact(
+        checksums_rel, CheckSumHash.DSL_FMHA_CHECKSUMS[cpu_arch][gpu_arch]
+    )
+    if not data:
+        raise RuntimeError(f"Failed to load DSL FMHA manifest: {checksums_rel}")
 
     checksums = {}
-    with open(local_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            sha256, filename = line.split(None, 1)
-            variant_name = filename.rsplit(".", 1)[0]  # strip .so extension
-            checksums[variant_name] = sha256
+    for line in data.decode("utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        sha256, filename = line.split(None, 1)
+        variant_name = filename.rsplit(".", 1)[0]  # strip .so extension
+        checksums[variant_name] = sha256
 
     _checksums_cache[gpu_arch] = checksums
     return checksums
@@ -115,6 +111,7 @@ def _dtype_to_str(dtype: torch.dtype) -> str:
         torch.float16: "fp16",
         torch.bfloat16: "bf16",
         torch.float8_e4m3fn: "e4m3",
+        torch.uint8: "e2m1",  # Packed NVFP4 output storage; converted at the ABI.
     }[dtype]
 
 
@@ -131,6 +128,11 @@ def _get_variant_name(
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
     use_pdl: bool = False,
+    page_size: Optional[int] = None,
+    kv_layout: str = "NHD",
+    num_q_heads: Optional[int] = None,
+    use_fp16_softmax: bool = False,
+    use_ragged_tma: bool = False,
 ) -> str:
     """Generate the variant name matching compile_cute_dsl_fmha.py naming convention."""
     qk_str = _dtype_to_str(qk_dtype)
@@ -152,8 +154,17 @@ def _get_variant_name(
     skip_str = "_skipsm" if enable_skip_softmax else ""
     sink_str = "_sink" if enable_sink else ""
     pdl_str = "_pdl" if use_pdl else ""
+    paged_str = f"_paged{page_size}" if page_size is not None else ""
+    layout_str = "_hnd" if page_size is not None and kv_layout == "HND" else ""
+    heads_str = f"_qh{num_q_heads}" if num_q_heads is not None else ""
+    ragged_tma_str = "_raggedtma" if use_ragged_tma else ""
+    fp16sm_str = "_fp16sm" if use_fp16_softmax else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
-    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}{ffi_str}"
+    return (
+        f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}"
+        f"{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}"
+        f"{paged_str}{layout_str}{heads_str}{ragged_tma_str}{fp16sm_str}{ffi_str}"
+    )
 
 
 # =============================================================================
@@ -250,6 +261,11 @@ def get_cute_dsl_fmha_kernel(
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
     use_pdl: bool = False,
+    page_size: Optional[int] = None,
+    kv_layout: str = "NHD",
+    num_q_heads: Optional[int] = None,
+    use_fp16_softmax: bool = False,
+    use_ragged_tma: bool = False,
 ):
     """Get a compiled DSL FMHA kernel function.
 
@@ -301,6 +317,11 @@ def get_cute_dsl_fmha_kernel(
         enable_skip_softmax=enable_skip_softmax,
         enable_sink=enable_sink,
         use_pdl=use_pdl,
+        page_size=page_size,
+        kv_layout=kv_layout,
+        num_q_heads=num_q_heads,
+        use_fp16_softmax=use_fp16_softmax,
+        use_ragged_tma=use_ragged_tma,
     )
 
     # Check for local .so directory (development mode)

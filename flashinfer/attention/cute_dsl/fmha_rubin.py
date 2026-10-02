@@ -1,0 +1,395 @@
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Explicit AOT-only entry points for Rubin ViT and paged GQA.
+
+These specializations are not implemented by the public FMHA JIT source. A
+missing artifact is an error, not permission to silently compile a different
+kernel. Warm up before CUDA graph capture (or preinstall the cubin wheel).
+
+The pinned MR199 collection supplies D72/D80 ViT and BF16 NHD paged GQA.
+HND, fused NVFP4 output, and the multi-sequence ragged page-table fix require
+new exports. Until those are published, use FLASHINFER_DSL_FMHA_LOCAL_DIR with
+the matching cubin_publishing build; this module does not invent a future pin.
+"""
+
+import math
+import os
+
+import torch
+from cutlass.cute.typing import Float32, Int32
+
+from .fmha import DSL_FMHA_ARTIFACT_PATH, _get_gpu_arch, get_cute_dsl_fmha_kernel
+
+
+def _require_tensor(tensor, name, device, dtype, ndim, *, compact=True, align=16):
+    if tensor.device != device or tensor.dtype != dtype or tensor.ndim != ndim:
+        raise ValueError(f"{name} must be a {ndim}D {dtype} tensor on {device}")
+    if compact and not tensor.is_contiguous():
+        raise ValueError(
+            f"{name} must be contiguous; implicit copies are not supported"
+        )
+    if tensor.data_ptr() % align:
+        raise ValueError(f"{name} must be {align}-byte aligned")
+
+
+def _require_rubin(q):
+    if q.device.type != "cuda" or _get_gpu_arch(q.device) != "sm_107a":
+        raise ValueError("These AOT FMHA specializations require a Rubin SM107 GPU")
+
+
+def _positive_scalar(value, name):
+    # Do not use float(tensor): that would synchronize or fail during capture.
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite host scalar")
+    return float(value)
+
+
+def _scales(scale_q, scale_k, scale_v, scale_o, sm_scale, head_dim):
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+    qk = (
+        _positive_scalar(scale_q, "scale_q")
+        * _positive_scalar(scale_k, "scale_k")
+        * _positive_scalar(sm_scale, "sm_scale")
+    )
+    output = _positive_scalar(scale_v, "scale_v") / _positive_scalar(scale_o, "scale_o")
+    return Float32(qk * math.log2(math.e)), Float32(qk), Float32(output)
+
+
+def _load_kernel(q, **kwargs):
+    try:
+        return get_cute_dsl_fmha_kernel(
+            _get_gpu_arch(q.device),
+            q.dtype,
+            q.dtype,
+            is_persistent=False,
+            enable_tvm_ffi=True,
+            varlen=True,
+            **kwargs,
+        )
+    except (RuntimeError, FileNotFoundError) as exc:
+        raise RuntimeError(
+            "The requested Rubin FMHA AOT specialization is unavailable. "
+            "Install matching published artifacts or set FLASHINFER_DSL_FMHA_LOCAL_DIR "
+            "to a matching exporter build. HND/NVFP4 and corrected batched-ragged "
+            "GQA exports are not included in the MR199 artifact pin. "
+            "There is no JIT fallback for this entry point."
+        ) from exc
+
+
+def cute_dsl_fmha_vit(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    max_seqlen: int,
+    *,
+    logical_head_dim: int = 72,
+    sm_scale: float | None = None,
+    scale_q: float = 1.0,
+    scale_k: float = 1.0,
+    scale_v: float = 1.0,
+    scale_o: float = 1.0,
+    use_fp16_softmax: bool = True,
+) -> None:
+    """Noncausal FP8 ViT attention at logical D72, with D80 storage.
+
+    ``q/k/v`` are compact E4M3 tensors [total_tokens, heads, 80]; ``o`` has
+    the same shape and BF16 dtype. Only its first 72 channels are defined.
+    Input padding must be zero. ``qo_indptr`` contains CUDA int32 cumulative
+    TOKEN counts (not cuDNN element offsets), shared by self-attention Q/K/V.
+    The default softmax scale uses logical D72, never padded D80.
+
+    Metadata values describe sequence lengths <= ``max_seqlen`` within the
+    tensor's token capacity. CUDA graph padding may repeat the final indptr
+    (empty requests) and leave an unused tensor tail; only active token rows
+    are defined. Value checks are the caller's responsibility; this API
+    performs no device-to-host reads.
+    Scalars are host-side dequantization scales. Output is modified in place.
+    """
+    _require_rubin(q)
+    if logical_head_dim != 72:
+        raise ValueError("The ViT AOT entry point supports logical D72 / storage D80")
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        _require_tensor(tensor, name, q.device, torch.float8_e4m3fn, 3)
+    _require_tensor(o, "o", q.device, torch.bfloat16, 3, align=32)
+    _require_tensor(qo_indptr, "qo_indptr", q.device, torch.int32, 1)
+    if q.shape != k.shape or q.shape != v.shape or q.shape != o.shape:
+        raise ValueError("ViT q/k/v/o must have identical padded shapes")
+    total, heads, storage = q.shape
+    if storage != 80 or total <= 0 or heads <= 0 or qo_indptr.numel() < 2:
+        raise ValueError(
+            "ViT requires positive tokens/heads, D80, and a nonempty batch"
+        )
+    if not isinstance(max_seqlen, int) or max_seqlen <= 0:
+        raise ValueError("max_seqlen must be a positive host integer")
+    kernel = _load_kernel(
+        q,
+        out_dtype=o.dtype,
+        head_dim=logical_head_dim,
+        is_causal=False,
+        use_fp16_softmax=use_fp16_softmax,
+    )
+    scale_log2, scale_sm, scale_out = _scales(
+        scale_q, scale_k, scale_v, scale_o, sm_scale, logical_head_dim
+    )
+    shape = (1, total, heads, 1, storage)
+    problem = (
+        qo_indptr.numel() - 1,
+        max_seqlen,
+        total,
+        max_seqlen,
+        heads,
+        heads,
+        logical_head_dim,
+        logical_head_dim,
+    )
+    kernel(
+        q.view(shape),
+        k.view(shape),
+        v.view(shape),
+        o.view(shape),
+        problem,
+        qo_indptr,
+        qo_indptr,
+        None,
+        None,
+        scale_log2,
+        scale_sm,
+        scale_out,
+        None,
+        None,
+        None,
+        None,
+        None,
+        False,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def cute_dsl_fmha_paged_prefill(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    o: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    page_table: torch.Tensor,
+    kv_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    *,
+    kv_layout: str = "HND",
+    sm_scale: float | None = None,
+    scale_q: float = 1.0,
+    scale_k: float = 1.0,
+    scale_v: float = 1.0,
+    scale_o: float = 1.0,
+    output_block_scale: torch.Tensor | None = None,
+    o_sf_scale: float | None = None,
+    o_sf_start_index: int = 0,
+    use_fp16_softmax: bool = True,
+    output_store: str | None = None,
+) -> None:
+    """Causal Rubin paged FP8 GQA, optionally with fused NVFP4 output.
+
+    Q is compact E4M3 [total_q, Hq, 128]. K/V are E4M3 pools of shape
+    [pages, Hkv, page_size, 128] (HND) or compact
+    [pages, page_size, Hkv, 128] (NHD). HND accepts non-overlapping positive
+    page/head/token strides, including views into interleaved K/V storage.
+    Both pools must have identical shapes/strides. No cache repacking occurs.
+
+    ``qo_indptr`` and ``kv_indptr`` contain cumulative TOKEN counts, NOT page
+    counts. ``kv_lens`` has the corresponding per-request KV token counts.
+    All metadata is CUDA int32; page_table has one compact row per request.
+    Caller guarantees valid page IDs, positive lengths, matching cumulative
+    counts and max-length bounds. There are no synchronizing value checks.
+
+    BF16 output has shape [total_q, Hq, 128]. Fused NVFP4 output uses uint8
+    packed E2M1 storage [total_q, 64, 64] and requires ``output_block_scale``:
+    the FULL contiguous E4M3 Layout128x4 allocation, with exactly 512 columns
+    and rows rounded up to 128. ``o_sf_start_index`` selects the first row;
+    pass an output payload slice but never a row-sliced scale buffer.
+    ``o_sf_scale`` is the positive global encoding multiplier. ``scale_o``
+    remains 1 for NVFP4; it is not the FP4 global scale.
+    ``output_store=None`` selects ragged TMA for NVFP4 and direct stores for
+    BF16. NVFP4 also accepts ``output_store="direct"`` for comparison.
+
+    Warm up this explicit AOT-only path before CUDA graph capture. Missing
+    specializations raise instead of falling back to BF16 or public JIT.
+    """
+    _require_rubin(q)
+    _require_tensor(q, "q", q.device, torch.float8_e4m3fn, 3)
+    for name, tensor in (("k_cache", k_cache), ("v_cache", v_cache)):
+        _require_tensor(tensor, name, q.device, q.dtype, 4, compact=False, align=32)
+    if kv_layout not in ("HND", "NHD"):
+        raise ValueError("kv_layout must be HND or NHD")
+    if k_cache.shape != v_cache.shape or k_cache.stride() != v_cache.stride():
+        raise ValueError("K/V cache shapes and strides must match")
+    if kv_layout == "HND":
+        pages, hk, page_size, d = k_cache.shape
+        sp, sh, sn, sd = k_cache.stride()
+        if sd != 1 or sn < d or sh < page_size * sn or sp < hk * sh:
+            raise ValueError(
+                "HND cache requires non-overlapping positive H/N/D strides"
+            )
+        if any(stride % 16 for stride in (sp, sh, sn)):
+            raise ValueError("HND page/head/token strides must be multiples of 16")
+    else:
+        pages, page_size, hk, d = k_cache.shape
+        if not k_cache.is_contiguous() or not v_cache.is_contiguous():
+            raise ValueError("The NHD export requires compact page pools")
+    total, hq, qd = q.shape
+    if (qd, d) != (128, 128) or page_size not in (16, 64, 128):
+        raise ValueError("Paged GQA requires D128 and page size 16, 64 or 128")
+    if min(total, hq, hk, pages) <= 0 or hq % hk:
+        raise ValueError(
+            "Paged GQA requires positive dimensions and Hq divisible by Hkv"
+        )
+    for name, tensor, ndim in (
+        ("qo_indptr", qo_indptr, 1),
+        ("kv_indptr", kv_indptr, 1),
+        ("page_table", page_table, 2),
+        ("kv_lens", kv_lens, 1),
+    ):
+        _require_tensor(
+            tensor,
+            name,
+            q.device,
+            torch.int32,
+            ndim,
+            align=4 if name == "kv_lens" else 16,
+        )
+    batch = page_table.shape[0]
+    if batch <= 0 or qo_indptr.numel() != batch + 1 or kv_indptr.numel() != batch + 1:
+        raise ValueError("Cumulative token counts must have batch_size + 1 entries")
+    if kv_lens.numel() != batch:
+        raise ValueError("kv_lens must have one entry per request")
+    if (
+        batch > 1
+        and kv_layout == "NHD"
+        and DSL_FMHA_ARTIFACT_PATH.startswith("a10580e7")
+        and not os.environ.get("FLASHINFER_DSL_FMHA_LOCAL_DIR")
+    ):
+        raise RuntimeError(
+            "MR199's NHD paged export ties page-table batch to packed Q batch=1. "
+            "Multi-sequence ragged GQA requires the corrected exporter build in "
+            "FLASHINFER_DSL_FMHA_LOCAL_DIR until a fixed collection is published."
+        )
+    if any(not isinstance(n, int) or n <= 0 for n in (max_q_len, max_kv_len)):
+        raise ValueError("max_q_len and max_kv_len must be positive host integers")
+    if page_table.shape[1] * page_size < max_kv_len:
+        raise ValueError("page_table has insufficient columns for max_kv_len")
+
+    fp4 = o.dtype == torch.uint8
+    if output_store is None:
+        output_store = "ragged_tma" if fp4 else "direct"
+    if output_store not in ("direct", "ragged_tma") or (
+        not fp4 and output_store != "direct"
+    ):
+        raise ValueError("output_store supports direct, or ragged_tma for NVFP4 only")
+    _require_tensor(
+        o, "o", q.device, torch.uint8 if fp4 else torch.bfloat16, 3, align=32
+    )
+    if o.shape != (total, hq, 64 if fp4 else 128):
+        raise ValueError(
+            "Output shape does not match the BF16 or packed NVFP4 contract"
+        )
+    sf = sf_scale = sf_start = None
+    if fp4:
+        if hq != 64:
+            raise ValueError("The NVFP4 export is specialized for Hq=64")
+        if output_block_scale is None:
+            raise ValueError("Packed NVFP4 output requires output_block_scale")
+        _require_tensor(output_block_scale, "output_block_scale", q.device, q.dtype, 2)
+        if not isinstance(o_sf_start_index, int) or o_sf_start_index < 0:
+            raise ValueError("o_sf_start_index must be a nonnegative host integer")
+        scale_rows = ((o_sf_start_index + total + 127) // 128) * 128
+        scale_cols = ((hq * d // 16 + 3) // 4) * 4
+        if (
+            output_block_scale.shape[0] < scale_rows
+            or output_block_scale.shape[1] != scale_cols
+        ):
+            raise ValueError(
+                "The full Layout128x4 scale allocation has the wrong shape"
+            )
+        if scale_o != 1.0:
+            raise ValueError("Use o_sf_scale, not scale_o, for NVFP4 encoding")
+        sf = output_block_scale.view(-1)
+        sf_scale = Float32(_positive_scalar(o_sf_scale, "o_sf_scale"))
+        sf_start = Int32(o_sf_start_index)
+        packed_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if packed_dtype is None:
+            raise RuntimeError(
+                "NVFP4 AOT requires PyTorch float4_e2m1fn_x2 for the TVM-FFI ABI"
+            )
+        # DLPack sees float4_e2m1fnx2; the CuTe FFI adapter expands logical D.
+        # Passing ordinary uint8 would fail the exported Float4 tensor schema.
+        o_arg = o.view(packed_dtype)
+    else:
+        if output_block_scale is not None or o_sf_scale is not None or o_sf_start_index:
+            raise ValueError("Output scale arguments apply only to packed NVFP4 output")
+        o_arg = o
+
+    kernel = _load_kernel(
+        q,
+        out_dtype=o.dtype,
+        head_dim=d,
+        is_causal=True,
+        use_pdl=True,
+        page_size=page_size,
+        kv_layout=kv_layout,
+        num_q_heads=hq if fp4 else None,
+        use_fp16_softmax=use_fp16_softmax,
+        use_ragged_tma=output_store == "ragged_tma",
+    )
+    scale_log2, scale_sm, scale_out = _scales(
+        scale_q, scale_k, scale_v, scale_o, sm_scale, d
+    )
+    if kv_layout == "HND":
+        k_arg, v_arg = k_cache, v_cache
+    else:
+        k_arg = k_cache.view(pages, page_size, hk, 1, d)
+        v_arg = v_cache.view(pages, page_size, hk, 1, d)
+    problem = (batch, max_q_len, total, max_kv_len, hq, hk, d, d)
+    kernel(
+        q.view(1, total, hk, hq // hk, d),
+        k_arg,
+        v_arg,
+        o_arg.view(1, total, hk, hq // hk, o.shape[-1]),
+        problem,
+        qo_indptr,
+        kv_indptr,
+        None,
+        None,
+        scale_log2,
+        scale_sm,
+        scale_out,
+        None,
+        None,
+        Int32(0),
+        None,
+        None,
+        True,
+        page_table,
+        sf,
+        sf_scale,
+        sf_start,
+        None,
+    )
