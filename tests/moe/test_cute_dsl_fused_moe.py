@@ -45,7 +45,7 @@ _requires_dsl_arch = pytest.mark.skipif(
 )
 
 
-from flashinfer.tllm_enums import ActivationType
+from flashinfer.tllm_enums import DEFAULT_SWIGLU_LIMIT, ActivationType
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
@@ -2123,6 +2123,85 @@ class TestCuteDslFusedMoeFunctional:
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize("swiglu_limit", [0.1, 0.2])
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_swiglu_clamp_accuracy(self, quant_mode: str, swiglu_limit: float):
+        """Accuracy test for clamped SwiGLU with the default alpha/beta.
+
+        Separate from ``test_swiglu_oai_accuracy``, which varies all three
+        constants at once and is skipped on Rubin: SM107 implements the clamp
+        but not a custom alpha/beta, so only this combination runs there.
+
+        ``create_moe_tensors`` draws x and w1 from ``N(0, 0.1^2)`` and
+        ``hidden_size`` is 256, putting the FC1 output standard deviation near
+        0.16, so both limits bind on a large share of the elements. The
+        comparison against an unclamped run is what makes that a fact rather
+        than an assumption -- a kernel that silently ignored ``swiglu_limit``
+        would otherwise still pass the accuracy check here.
+        """
+        from flashinfer import cute_dsl_fused_moe
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 256, 2
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
+            tensors, quant_mode
+        )
+
+        def run(limit):
+            return cute_dsl_fused_moe(
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                activation_type=ActivationType.Swiglu,
+                swiglu_limit=limit,
+                quant_mode=quant_mode,
+                **api_inputs,
+            )
+
+        result = run(swiglu_limit)
+
+        ref_output = compute_reference_moe_fp4(
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=ActivationType.Swiglu,
+            swiglu_limit=swiglu_limit,
+            **reference_inputs,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+        unclamped = run(DEFAULT_SWIGLU_LIMIT).float()
+        drift = (result.float() - unclamped).norm() / unclamped.norm()
+        assert drift > 0.05, (
+            f"swiglu_limit={swiglu_limit} moved the output by only "
+            f"{drift:.2e} relative to the unclamped run; the clamp is not "
+            "reaching the kernel, or the limit is too loose to bind"
         )
 
 

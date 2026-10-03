@@ -323,8 +323,9 @@ def _get_compiled_gather_kernel(
     if cache_key not in _gather_kernel_cache:
         if is_rubin:
             # The Rubin (SM107) kernel implements SwiGLU (plus its SiTU variant,
-            # selected by situ_beta) and Relu2, with the default SwiGLU
-            # constants. GeGLU-tanh is not implemented.
+            # selected by situ_beta) and Relu2. It supports the SwiGLU clamp
+            # (``swiglu_limit``) but not a custom ``swiglu_alpha`` /
+            # ``swiglu_beta``. GeGLU-tanh is not implemented.
             if normalized_activation_type not in (
                 ActivationType.Swiglu,
                 ActivationType.Relu2,
@@ -334,15 +335,14 @@ def _get_compiled_gather_kernel(
                     "the Rubin (SM107) gather grouped GEMM kernel yet "
                     "(SwiGLU, SiTU and Relu2 only)."
                 )
-            if (swiglu_alpha, swiglu_beta, swiglu_limit) != (
+            if (swiglu_alpha, swiglu_beta) != (
                 DEFAULT_SWIGLU_ALPHA,
                 DEFAULT_SWIGLU_BETA,
-                DEFAULT_SWIGLU_LIMIT,
             ):
                 raise NotImplementedError(
-                    "Custom swiglu_alpha/swiglu_beta/swiglu_limit are not "
-                    "supported by the Rubin (SM107) gather grouped GEMM "
-                    "kernel yet."
+                    "Custom swiglu_alpha/swiglu_beta are not supported by the "
+                    "Rubin (SM107) gather grouped GEMM kernel yet; only the "
+                    "swiglu_limit clamp is."
                 )
             if use_a_per_token_scale:
                 raise NotImplementedError(
@@ -363,6 +363,7 @@ def _get_compiled_gather_kernel(
                 activation_type=normalized_activation_type.value,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                swiglu_limit=swiglu_limit,
             )
         else:
             # Create kernel instance
