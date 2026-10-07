@@ -100,7 +100,9 @@ def test_per_call_norm_const_and_alpha_reach_the_kernel():
             MoEEpTensors(x, ids, w, fc1_alpha=a1, fc2_alpha=a2, fc1_norm_const=nc)
         )
         ws = layer._ensure_workspace()
-        assert torch.equal(ws.fc1_norm_const, nc) and torch.equal(ws.fc2_alpha, a2)
+        # bound per-call scalars (default) or copied ones (FLASHINFER_SM107_MEGA_COPY_SCALARS=1)
+        assert torch.equal(ws._scalar_tensor("fc1_norm_const"), nc)
+        assert torch.equal(ws._scalar_tensor("fc2_alpha"), a2)
         idx, exp = pkg.sampled_reference(ws, *layer._transformed, T)
         assert pkg.output_error(y, idx, exp) < 0.06
         # a different (non power-of-two) norm const changes the requant grid -> different output

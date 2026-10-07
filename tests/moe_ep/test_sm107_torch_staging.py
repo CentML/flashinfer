@@ -205,6 +205,7 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
         ws.launch(*weights)
     graph.replay()
     torch.cuda.synchronize()
-    assert ws._launch_key[-1] == stream.cuda_stream
+    # launch key = 4 weight pointers, the stream, then the bound NVFP4 scalar pointers
+    assert ws._launch_key[4] == stream.cuda_stream
     assert (ws.output_activation == 3).all()
     del graph
