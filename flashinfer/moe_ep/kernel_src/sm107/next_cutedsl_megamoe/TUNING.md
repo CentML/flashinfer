@@ -228,8 +228,8 @@ reference and every candidate. The layer API also accepts distinct values per
 local expert; see the [normalization contract](../../../../../docs/design_docs/moe_ep_sm107_qualification.md#nvfp4-normalization).
 
 The cache distinguishes the SM107 implementation revision, geometry,
-quantization, activation and beta parameters, gate/up clamp, early/late routing
-weights, and nondeterminism permission.
+quantization, kernel variant, activation and beta parameters, gate/up clamp,
+early/late routing weights, and nondeterminism permission.
 Legacy entries from the original PR are ignored. In-kernel reduction is
 excluded by default; `--allow-nondeterministic` opts it into tuning.
 Engine-side cache lookup requires `in_kernel_fc2_reduce=True` to permit

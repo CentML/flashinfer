@@ -46,7 +46,9 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # "cache" uses an offline winner or the heuristic fallback. Online "auto"
     # is unsupported because the kernel fixes its knobs at construction.
     knobs: dict | str | None = None
-    max_sm_count: Optional[int] = None
+    # SM budget of the persistent kernel (uniform cluster launch): an int, or
+    # ((max_tokens, sm_count), ...) pairs resolved per workspace capacity.
+    max_sm_count: Optional[int | Tuple[Tuple[int, int], ...]] = None
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
@@ -54,3 +56,7 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
     fc1_norm_const: Optional["torch.Tensor"] = None
+    # Kernel composition. Only the generic RubinInferenceMegaMoE kernel is wired
+    # here ("inference"); the field (FlashInfer PR #5991) is part of the knob-cache
+    # identity and of callers' config contract (vLLM passes it).
+    kernel_variant: Literal["inference"] = "inference"

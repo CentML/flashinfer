@@ -33,6 +33,7 @@ from typing import Any, Literal, Optional, Tuple
 import torch
 
 from . import comm
+from .clear_invalid import clear_invalid_route_slots, use_torch_clear
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 
@@ -128,7 +129,7 @@ class Sm107BlockScaledMoeConfig:
     rank: int
     world_size: int
     quant_kind: Sm107QuantKind = "mxfp8_e4m3"
-    mma_tiler_mnk: Optional[Tuple[int, int, int]] = None  # None -> (256, 128, 4*ik)
+    mma_tiler_mnk: Optional[Tuple[int, int, int]] = None  # None -> (256, 128, 2*ik)
     cluster_shape_mn: Tuple[int, int] = (2, 1)
     # Mixed-CGA launch: alongside the preferred clusters, fill leftover SMs with
     # smaller fallback clusters (upstream commit a5b4d33). None = uniform launch.
@@ -152,9 +153,17 @@ class Sm107BlockScaledMoeConfig:
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
 
+    # Only the generic inference kernel is wired (knob-cache identity field).
+    kernel_variant: Literal["inference"] = "inference"
+
     def __post_init__(self) -> None:
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
+        if self.kernel_variant != "inference":
+            raise ValueError(
+                f"unsupported kernel_variant {self.kernel_variant!r} "
+                "(only the generic inference kernel is wired)."
+            )
         if self.activation not in ("swiglu", "situ"):
             raise ValueError("activation must be 'swiglu' or 'situ'.")
         if self.activation == "situ":
@@ -457,10 +466,10 @@ class Sm107BlockScaledSymmBuffer:
             region = kernel.token_comm.pre_reduced_activation_region
             start = workspace.offset(region)
             end = start + workspace.nbytes(region)
-            self._pre_reduced_activation = (
-                self.shared_workspace[start:end]
-                .view(torch.bfloat16)
-                .view(tokens, cfg.num_topk, cfg.hidden)
+            # Byte view (token, k, row bytes) of the BF16 combine slots: what the
+            # invalid-slot clear (clear_invalid_route_slots / masked_fill_) works on.
+            self._pre_reduced_activation = self.shared_workspace[start:end].view(
+                tokens, cfg.num_topk, -1
             )
         if (
             self.local_workspace.data_ptr() % 128 != 0
@@ -481,6 +490,7 @@ class Sm107BlockScaledSymmBuffer:
             Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
         ] = None
         self._staged_tokens: Optional[int] = None
+        self._live_output_views: dict = {}
         self._destroyed = False
 
     @staticmethod
@@ -659,17 +669,49 @@ class Sm107BlockScaledSymmBuffer:
             self._launch_kwargs = kwargs
             # Keep pointers alive until the cached bindings are replaced.
             self._launch_weights = (transformed_l1, transformed_l2)
+        # Live rows: only output[:num_tokens] is returned, so the TopkReduce grid and
+        # the in-kernel-reduce zero base cover the staged rows, not the whole
+        # capacity (the original full-capacity behaviour costs ~capacity*topk*H*2
+        # bytes of TopkReduce reads per launch; FLASHINFER_SM107_MEGA_TORCH_CLEAR=1
+        # restores it for A/B checks).
+        # Non-CUDA (portable contract tests) and workspaces built without __init__
+        # keep the original full-capacity torch behaviour.
+        full = use_torch_clear() or not self.topk_idx.is_cuda
+        capacity = self.output_activation.shape[0]
+        staged = getattr(self, "_staged_tokens", None)
+        live = (
+            capacity if (full or staged is None) else max(1, min(int(staged), capacity))
+        )
+        launch_kwargs = self._launch_kwargs
+        if live < capacity:
+            views = getattr(self, "_live_output_views", None)
+            if views is None or len(views) >= 64:
+                views = self._live_output_views = {}
+            out_view = views.get(live)
+            if out_view is None:
+                out_view = _to_cute(self.output_activation[:live])
+                views[live] = out_view
+            launch_kwargs = dict(launch_kwargs, output_activation=out_view)
         if self.config.reduce_topk_in_kernel:
-            # red.add accumulation base: zero the output every launch.
-            self.output_activation.zero_()
+            # red.add accumulation base: zero the (live) output every launch.
+            self.output_activation[:live].zero_()
         else:
             # Invalid routes do not write a combine slot. Clear those slots on
             # every launch so a masked route cannot reuse an earlier result.
-            invalid = (self.topk_idx < 0) | (
-                self.topk_idx >= self.config.num_total_experts
-            )
-            self._pre_reduced_activation.masked_fill_(invalid.unsqueeze(-1), 0)
-        self._compiled(**self._launch_kwargs)
+            if full:
+                invalid = (self.topk_idx < 0) | (
+                    self.topk_idx >= self.config.num_total_experts
+                )
+                self._pre_reduced_activation.masked_fill_(invalid.unsqueeze(-1), 0)
+            else:
+                # Only the staged rows are consumed (output[:num_tokens]); clear
+                # just their invalid routes instead of rewriting the whole
+                # capacity-sized buffer (WP6: ~25% of the step at capacity 16k).
+                experts = self.config.num_total_experts
+                clear_invalid_route_slots(
+                    self.topk_idx, live, experts, self._pre_reduced_activation, 0
+                )
+        self._compiled(**launch_kwargs)
 
     def destroy(self) -> None:
         if self._destroyed:
@@ -681,6 +723,7 @@ class Sm107BlockScaledSymmBuffer:
         torch.cuda.synchronize()
         self._compiled = None
         self._launch_kwargs = None
+        self._live_output_views = {}
         self._launch_weights = None
         self._pre_reduced_activation = None
         for name in ("x", "x_sf", "topk_weights", "shared_workspace"):
@@ -705,6 +748,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     world_size: int,
     *,
     quant_kind: Sm107QuantKind = "mxfp8_e4m3",
+    kernel_variant: Literal["inference"] = "inference",
     mma_tiler_mnk: Optional[Tuple[int, int, int]] = None,
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -740,6 +784,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         rank=rank,
         world_size=world_size,
         quant_kind=quant_kind,
+        kernel_variant=kernel_variant,
         mma_tiler_mnk=mma_tiler_mnk,
         cluster_shape_mn=cluster_shape_mn,
         fallback_cluster_shape_mn=fallback_cluster_shape_mn,

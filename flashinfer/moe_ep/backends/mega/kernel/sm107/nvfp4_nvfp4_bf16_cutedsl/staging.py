@@ -2,7 +2,39 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
+
+
+def use_torch_stage() -> bool:
+    """``FLASHINFER_SM107_MEGA_TORCH_STAGE=1`` restores the torch-composed quantizer."""
+    return os.environ.get("FLASHINFER_SM107_MEGA_TORCH_STAGE", "0") == "1"
+
+
+def _fast_nvfp4_quantize(hidden_states: torch.Tensor, norm_const: float):
+    """One-launch NVFP4 quantization (flashinfer CuTe-DSL kernel, linear E4M3 scales).
+
+    The torch-composed ``quantize_nvfp4_block16`` materialises an 8-way fp32 distance
+    tensor per element (~32x the bf16 input bytes, >10 launches); this kernel reads the
+    bf16 rows once. Same recipe: ``sf = e4m3(amax / 6 * norm_const)``, data RN-even E2M1
+    of ``x * norm_const / sf`` (the TRT-LLM / vLLM ``cvt`` semantics; reciprocal fast-math
+    unless ``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1``). Returns ``None`` when the input
+    is not supported, so the caller falls back to the torch path.
+    """
+    if use_torch_stage() or hidden_states.dtype not in (torch.bfloat16, torch.float16):
+        return None
+    if hidden_states.shape[1] % 64 or not hidden_states.is_contiguous():
+        return None
+    from .......quantization.kernels.nvfp4_quantize import (
+        SF_LAYOUT_LINEAR,
+        nvfp4_quantize_cute_dsl,
+    )
+
+    q, sf = nvfp4_quantize_cute_dsl(
+        hidden_states, float(norm_const), sf_layout=SF_LAYOUT_LINEAR, nvfp4_4over6=None
+    )
+    return q, sf.reshape(hidden_states.shape[0], -1)
 
 
 def stage_mega_moe_inputs(
@@ -15,6 +47,7 @@ def stage_mega_moe_inputs(
     topk_weights_out: torch.Tensor,
     *,
     input_norm_const: float = 1.0,
+    routes_staged: bool = False,
 ) -> int:
     """bf16 ``hidden_states`` -> packed NVFP4 activation + FP8-E4M3 block scales.
 
@@ -40,9 +73,13 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    q, sf = quantize_nvfp4_block16(
-        hidden_states.to(torch.float32), norm_const=input_norm_const
-    )
+    fast = _fast_nvfp4_quantize(hidden_states, input_norm_const)
+    if fast is not None:
+        q, sf = fast
+    else:
+        q, sf = quantize_nvfp4_block16(
+            hidden_states.to(torch.float32), norm_const=input_norm_const
+        )
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     if x_sf.shape[1] < hidden_sf_cols:
@@ -52,12 +89,14 @@ def stage_mega_moe_inputs(
         )
 
     x_nvfp4[:num_tokens].view(torch.uint8).copy_(q.view(torch.uint8))
-    x_sf[:num_tokens].view(torch.uint8).zero_()
+    if x_sf.shape[1] != hidden_sf_cols:
+        x_sf[:num_tokens].view(torch.uint8).zero_()
     x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
-    topk_idx_out[:num_tokens].copy_(topk_ids.to(torch.int32))
-    topk_weights_out[:num_tokens].copy_(topk_weights.to(torch.float32))
-    if num_tokens < capacity:
-        topk_idx_out[num_tokens:capacity].fill_(-1)
+    if not routes_staged:
+        topk_idx_out[:num_tokens].copy_(topk_ids.to(torch.int32))
+        topk_weights_out[:num_tokens].copy_(topk_weights.to(torch.float32))
+        if num_tokens < capacity:
+            topk_idx_out[num_tokens:capacity].fill_(-1)
     return num_tokens
 
 

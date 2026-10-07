@@ -116,6 +116,12 @@ from .backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
 from .backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl import (
     Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm107_nvfp4_mega_weights,
+    sm107_nvfp4_checkpoint_scalars,
+)
+from .backends.mega.kernel.sm107.capacity import (
+    sm107_capacity_ladder,
+    sm107_max_tokens_per_rank,
+    sm107_select_capacity,
 )
 
 # Deprecated aliases (pre-taxonomy names, kept for external callers such as
@@ -315,6 +321,10 @@ __all__ = [
     "preprocess_sm107_mxfp4_mega_weights",
     "preprocess_sm107_mxfp8_mega_weights",
     "preprocess_sm107_nvfp4_mega_weights",
+    "sm107_nvfp4_checkpoint_scalars",
+    "sm107_capacity_ladder",
+    "sm107_max_tokens_per_rank",
+    "sm107_select_capacity",
     "preprocess_sm90_pull_fp8_mega_weights",
     "preprocess_sm90_push_cake_bf16_mega_weights",
     "preprocess_sm90_push_fp8_mega_weights",

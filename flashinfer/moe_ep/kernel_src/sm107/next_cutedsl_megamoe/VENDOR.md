@@ -81,8 +81,10 @@ the older drop. At FlashInfer `0f710df8`, this export passed 187 host/CUDA check
 with no skips. See the
 [qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md)
 for coverage and the separate reference-decoder regression.
-Tuning-cache entries use revision `sm107-block-scaled-1667b47a-v4`, which includes
-activation, beta parameters, and clamp settings in the cache identity.
+Tuning-cache entries use revision `sm107-block-scaled-1667b47a-runtime-options-v1`
+(the cache identity of FlashInfer PR #5991), which includes the kernel variant,
+activation, beta parameters, and clamp settings in the cache identity. Only the
+generic inference kernel (`kernel_variant="inference"`) is selectable here.
 
 ## Export transformations
 

@@ -2,7 +2,29 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
+
+
+def _fast_mxfp8_quantize(hidden_states: torch.Tensor, kind: str):
+    """One-launch MXFP8 E4M3 quantization (flashinfer CuTe-DSL kernel, linear E8M0 scales).
+
+    Same round-up E8M0 rule as ``quantize_mxfp8_block32``. ``None`` -> torch fallback
+    (E5M2 data, unsupported dtype or ``FLASHINFER_SM107_MEGA_TORCH_STAGE=1``).
+    """
+    if os.environ.get("FLASHINFER_SM107_MEGA_TORCH_STAGE", "0") == "1":
+        return None
+    if kind not in ("mxfp8_e4m3", "mxfp4_mxfp8"):
+        return None
+    if hidden_states.dtype not in (torch.bfloat16, torch.float16):
+        return None
+    if hidden_states.shape[1] % 128 or not hidden_states.is_contiguous():
+        return None
+    from .......quantization.kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
+
+    q, sf = mxfp8_quantize_cute_dsl(hidden_states, is_sf_swizzled_layout=False)
+    return q, sf.reshape(hidden_states.shape[0], -1)
 
 
 def _data_dtype(kind: str) -> torch.dtype:
@@ -23,11 +45,12 @@ def stage_mega_moe_inputs(
     topk_weights_out: torch.Tensor,
     *,
     kind: str = "mxfp8_e4m3",
+    routes_staged: bool = False,
 ) -> int:
     """bf16 ``hidden_states`` -> MXFP8 activation + E8M0 block scales.
 
-    Torch-composed staging (the ``next/`` drop has no fused staging kernel
-    yet). Returns the staged token count.
+    Quantization runs as one flashinfer CuTe-DSL MXFP8 kernel for E4M3 data
+    (torch-composed fallback otherwise). Returns the staged token count.
     """
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
         Mxfp8BlockSize,
@@ -44,7 +67,13 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    q, sf = quantize_mxfp8_block32(hidden_states.to(torch.float32), _data_dtype(kind))
+    fast = _fast_mxfp8_quantize(hidden_states, kind)
+    if fast is not None:
+        q, sf = fast
+    else:
+        q, sf = quantize_mxfp8_block32(
+            hidden_states.to(torch.float32), _data_dtype(kind)
+        )
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
     if x_sf.shape[1] < hidden_sf_cols:
@@ -54,12 +83,14 @@ def stage_mega_moe_inputs(
         )
 
     x_fp8[:num_tokens].view(torch.uint8).copy_(q.view(torch.uint8))
-    x_sf[:num_tokens].view(torch.uint8).zero_()
+    if x_sf.shape[1] != hidden_sf_cols:
+        x_sf[:num_tokens].view(torch.uint8).zero_()
     x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
-    topk_idx_out[:num_tokens].copy_(topk_ids.to(torch.int32))
-    topk_weights_out[:num_tokens].copy_(topk_weights.to(torch.float32))
-    if num_tokens < capacity:
-        topk_idx_out[num_tokens:capacity].fill_(-1)
+    if not routes_staged:
+        topk_idx_out[:num_tokens].copy_(topk_ids.to(torch.int32))
+        topk_weights_out[:num_tokens].copy_(topk_weights.to(torch.float32))
+        if num_tokens < capacity:
+            topk_idx_out[num_tokens:capacity].fill_(-1)
     return num_tokens
 
 

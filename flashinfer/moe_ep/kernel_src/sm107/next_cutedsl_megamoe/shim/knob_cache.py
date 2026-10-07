@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _CACHE_VERSION = 1
 _KEY_FIELDS = (
     "backend_revision",
+    "kernel_variant",
     "allow_nondeterministic",
     "apply_topk_at_fc1",
     "device",
@@ -119,6 +120,7 @@ def lookup_knobs(
     topk: int,
     max_tokens: int,
     combine_dtype: str = "bf16",
+    kernel_variant: str = "inference",
     device: Optional[str] = None,
     allow_nondeterministic: bool = False,
     apply_topk_at_fc1: bool = True,
@@ -132,7 +134,8 @@ def lookup_knobs(
     if path is None:
         return None
     key = dict(
-        backend_revision="sm107-block-scaled-1667b47a-v4",
+        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
+        kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
         activation=activation,
@@ -179,6 +182,7 @@ def record_knobs(
     topk: int,
     max_tokens: int,
     combine_dtype: str = "bf16",
+    kernel_variant: str = "inference",
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
@@ -202,7 +206,8 @@ def record_knobs(
     if path is None:
         return None
     entry = dict(
-        backend_revision="sm107-block-scaled-1667b47a-v4",
+        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
+        kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
         activation=activation,
@@ -293,6 +298,7 @@ def resolve_knobs(
     topk: int,
     max_tokens: int,
     combine_dtype: str = "bf16",
+    kernel_variant: str = "inference",
     allow_nondeterministic: bool = False,
     apply_topk_at_fc1: bool = True,
     activation: str = "swiglu",
@@ -313,6 +319,7 @@ def resolve_knobs(
         topk=topk,
         max_tokens=max_tokens,
         combine_dtype=combine_dtype,
+        kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
         activation=activation,

@@ -20,7 +20,11 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
-from ..validation import validate_routing_values, validate_unit_scalars
+from ..validation import (
+    max_sm_count_key,
+    stage_routing_plane,
+    validate_unit_scalars,
+)
 from .config import Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig, Sm107Mxfp8Kind
 from .staging import stage_mega_moe_inputs, validate_sm107_forward_inputs
 from .weights import (
@@ -165,6 +169,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 allow_nondeterministic=k.in_kernel_fc2_reduce,
                 apply_topk_at_fc1=k.apply_topk_in_fc1,
                 activation=k.activation,
+                kernel_variant=k.kernel_variant,
                 situ_beta=k.situ_beta,
                 situ_linear_beta=k.situ_linear_beta,
                 gate_up_clamp=_resolve_gate_up_clamp(k),
@@ -204,19 +209,21 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def stage_inputs(
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
-        validate_routing_values(
-            t.topk_ids, t.topk_weights, workspace.config.num_total_experts
+        # One launch: route validation + int32/fp32 routing staging + tail mask.
+        routed, topk_ids, topk_weights = stage_routing_plane(
+            t.topk_ids, t.topk_weights, workspace
         )
         if quantize_input:
             staged = stage_mega_moe_inputs(
                 t.hidden_states,
-                t.topk_weights,
-                t.topk_ids,
+                topk_weights,
+                topk_ids,
                 workspace.x,
                 workspace.x_sf,
                 workspace.topk_idx,
                 workspace.topk_weights,
                 kind=self._kernel_config.kind,
+                routes_staged=routed,
             )
             workspace.note_staged_tokens(staged)
             return
@@ -232,9 +239,12 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             workspace.x_sf[:num_tokens, :sf_cols].view(torch.uint8).copy_(
                 t.scales.view(torch.uint8)
             )
-            workspace.topk_idx[:num_tokens].copy_(t.topk_ids.to(torch.int32))
-            workspace.topk_weights[:num_tokens].copy_(t.topk_weights.to(torch.float32))
-        if num_tokens < capacity:
+            if not routed:
+                workspace.topk_idx[:num_tokens].copy_(topk_ids.to(torch.int32))
+                workspace.topk_weights[:num_tokens].copy_(
+                    topk_weights.to(torch.float32)
+                )
+        if num_tokens < capacity and not routed:
             workspace.topk_idx[num_tokens:capacity].fill_(-1)
         workspace.note_staged_tokens(num_tokens)
 
@@ -285,6 +295,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             fp.token_hidden_size,
             k.intermediate_size,
             k.activation,
+            k.kernel_variant,
             k.situ_beta,
             k.situ_linear_beta,
             k.kind,
@@ -301,7 +312,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.mma_tiler_mnk,
             k.cluster_shape_mn,
             k.fallback_cluster_shape_mn,
-            k.max_sm_count,
+            max_sm_count_key(k.max_sm_count),
             knobs_pool_key(k.knobs),
         )
 

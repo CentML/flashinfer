@@ -9,6 +9,33 @@ import torch
 from .....core.validation.common import MoEEpConfigError
 
 
+def resolve_max_sm_count(spec, max_tokens_per_rank: int):
+    """SM budget for one workspace capacity.
+
+    ``spec``: ``None`` / ``0`` (no cap), an int (every capacity), or a sequence of
+    ``(max_tokens, sm_count)`` pairs: the first pair (ascending ``max_tokens``)
+    with ``capacity <= max_tokens`` wins, the last pair covers larger
+    capacities; ``sm_count`` 0 means no cap for that range. Lets a concurrent
+    side-stream workload (e.g. a shared-expert MLP) get the SMs the megakernel
+    does not need at that size."""
+    if spec is None or isinstance(spec, int):
+        return spec or None
+    pairs = sorted((int(t), int(n)) for t, n in spec)
+    if not pairs:
+        return None
+    for max_tokens, count in pairs:
+        if max_tokens_per_rank <= max_tokens:
+            return count or None
+    return pairs[-1][1] or None
+
+
+def max_sm_count_key(spec):
+    """Hashable form of a ``max_sm_count`` spec (workspace pool keys)."""
+    if spec is None or isinstance(spec, int):
+        return spec
+    return tuple(sorted((int(t), int(n)) for t, n in spec))
+
+
 def make_workspace_config(
     k, fleet_params, *, rank, world_size, quant_kind, gate_up_clamp, overrides
 ):
@@ -20,6 +47,15 @@ def make_workspace_config(
     tuning = {name: getattr(k, name) for name in KNOB_KEYS if hasattr(k, name)}
     tuning["reduce_topk_in_kernel"] = k.in_kernel_fc2_reduce
     tuning.update(overrides)
+    max_sm_count = resolve_max_sm_count(
+        getattr(k, "max_sm_count", None), fleet_params.max_tokens_per_rank
+    )
+    if max_sm_count is not None:
+        # An SM budget (e.g. to leave SMs to a concurrent shared-expert MLP on a
+        # side stream) needs a uniform cluster launch: the mixed-CGA fallback
+        # occupancy is resolved from the hardware probe, so cached / heuristic
+        # knobs that name a fallback cluster are launched uniformly instead.
+        tuning["fallback_cluster_shape_mn"] = None
     for name in (
         "mma_tiler_mnk",
         "cluster_shape_mn",
@@ -38,12 +74,13 @@ def make_workspace_config(
             rank=rank,
             world_size=world_size,
             quant_kind=quant_kind,
+            kernel_variant=k.kernel_variant,
             gate_up_clamp=gate_up_clamp,
             activation=k.activation,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
             apply_topk_at_fc1=k.apply_topk_in_fc1,
-            max_sm_count=k.max_sm_count,
+            max_sm_count=max_sm_count,
             **tuning,
         )
     except (TypeError, ValueError) as exc:
@@ -198,3 +235,24 @@ def validate_weight_layout(weight, scale, *, scale_dtype) -> None:
         raise MoEEpConfigError("SM107 weights and scales must be on the same device")
     if weight.data_ptr() % 16 or scale.data_ptr() % 16:
         raise MoEEpConfigError("SM107 weights and scales must be 16-byte aligned")
+
+
+def stage_routing_plane(topk_ids, topk_weights, workspace):
+    """Stage (+ validate) the routing plane.
+
+    Returns ``(routed, ids, weights)``: ``routed`` is True when the one-launch Triton path
+    wrote the workspace plane; otherwise ``ids`` / ``weights`` are the tensors the caller
+    copies (after the torch route validation)."""
+    from .route_stage import stage_routes
+
+    num_experts = workspace.config.num_total_experts
+    routed = stage_routes(
+        topk_ids,
+        topk_weights,
+        workspace.topk_idx,
+        workspace.topk_weights,
+        num_experts,
+    )
+    if not routed:
+        validate_routing_values(topk_ids, topk_weights, num_experts)
+    return routed, topk_ids, topk_weights
