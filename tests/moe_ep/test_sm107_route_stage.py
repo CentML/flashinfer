@@ -99,6 +99,7 @@ def test_stage_routes_kernel_masks_capacity(capacity, num_tokens):
         ids_full,
         w_full,
         flag,
+        flag,  # pad_ptr (unused: HAS_PAD=False)
         num_tokens,
         capacity,
         NUM_EXPERTS,
@@ -106,6 +107,8 @@ def test_stage_routes_kernel_masks_capacity(capacity, num_tokens):
         KP=triton.next_power_of_2(TOP_K),
         BLOCK_R=64,
         CHECK=False,
+        HAS_PAD=False,
+        KEEP_FIRST=False,
     )
     torch.cuda.synchronize()
     assert torch.equal(ids_full[:capacity], ids[:capacity])

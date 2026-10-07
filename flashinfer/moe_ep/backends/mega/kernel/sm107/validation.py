@@ -237,12 +237,16 @@ def validate_weight_layout(weight, scale, *, scale_dtype) -> None:
         raise MoEEpConfigError("SM107 weights and scales must be 16-byte aligned")
 
 
-def stage_routing_plane(topk_ids, topk_weights, workspace):
+def stage_routing_plane(
+    topk_ids, topk_weights, workspace, pad_mask=None, keep_first_row=False
+):
     """Stage (+ validate) the routing plane.
 
-    Returns ``(routed, ids, weights)``: ``routed`` is True when the one-launch Triton path
-    wrote the workspace plane; otherwise ``ids`` / ``weights`` are the tensors the caller
-    copies (after the torch route validation)."""
+    ``pad_mask`` (optional, ``[>= num_tokens]``): rows to stage without routes;
+    ``keep_first_row`` keeps row 0's routes. Returns ``(routed, ids, weights)``:
+    ``routed`` is True when the one-launch Triton path wrote the workspace plane;
+    otherwise ``ids`` / ``weights`` are the (masked) tensors the caller copies (after the
+    torch route validation)."""
     from .route_stage import stage_routes
 
     num_experts = workspace.config.num_total_experts
@@ -252,7 +256,16 @@ def stage_routing_plane(topk_ids, topk_weights, workspace):
         workspace.topk_idx,
         workspace.topk_weights,
         num_experts,
+        pad_mask=pad_mask,
+        keep_first_row=keep_first_row,
     )
+    ids = topk_ids
+    if not routed and pad_mask is not None:
+        pad = pad_mask[: ids.shape[0]].to(torch.bool)
+        if keep_first_row and pad.numel() > 0:
+            pad = pad.clone()
+            pad[0] = False
+        ids = torch.where(pad.unsqueeze(1), torch.full_like(ids, -1), ids)
     if not routed:
-        validate_routing_values(topk_ids, topk_weights, num_experts)
-    return routed, topk_ids, topk_weights
+        validate_routing_values(ids, topk_weights, num_experts)
+    return routed, ids, topk_weights

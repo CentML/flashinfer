@@ -32,6 +32,12 @@ class MoEEpTensors:
     fc1_norm_const: Optional["torch.Tensor"] = None
     recv_count: Optional["torch.Tensor"] = None
     num_tokens_per_expert: Optional["torch.Tensor"] = None
+    # SM107 mega backends: rows to stage without routes (bool [num_tokens], True =
+    # padding row -> every topk id -1), folded into the one-launch route staging
+    # instead of a separate masking pass by the caller. ``keep_first_route`` keeps
+    # row 0's routes even when it is padding (no rank stages a zero-route plane).
+    route_padding_mask: Optional["torch.Tensor"] = None
+    keep_first_route: bool = False
 
     @property
     def num_tokens(self) -> int:
