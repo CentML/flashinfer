@@ -363,11 +363,14 @@ run_mega_sm90() {
     -m "gpu_4 and arch_hopper"
 }
 
-# Distributed Rubin MoEEpLayer tests against the Torch oracle.
+# Distributed Rubin MoEEpLayer tests against the Torch oracle, plus the
+# phase-interleave scheduler deadlock stress (overlapped side stream, tiny and
+# skewed per-rank work).
 run_mega_sm107() {
   CUTE_DSL_ARCH=sm_107a "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py -v \
+    tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py \
+    tests/moe_ep/test_moe_ep_sm107_phase_interleave_stress_multirank.py -v \
     -m "gpu_2 and arch_rubin"
 }
 
