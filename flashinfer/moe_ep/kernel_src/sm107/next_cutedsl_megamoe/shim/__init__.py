@@ -24,6 +24,7 @@ from .block_scaled import (
     Sm107QuantKind,
     TransformedBlockScaledWeights,
     get_symm_buffer_for_sm107_block_scaled_mega_moe,
+    sm107_block_scaled_mega_finish_reduce,
     sm107_block_scaled_mega_launch_thunk,
     sm107_block_scaled_mega_moe,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "require_sm107_dsl",
     "resolve_knobs",
     "sampled_reference",
+    "sm107_block_scaled_mega_finish_reduce",
     "sm107_block_scaled_mega_launch_thunk",
     "sm107_block_scaled_mega_moe",
     "sm107_candidates",

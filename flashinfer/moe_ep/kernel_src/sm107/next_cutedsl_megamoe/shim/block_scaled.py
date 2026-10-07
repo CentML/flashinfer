@@ -34,6 +34,7 @@ import torch
 
 from . import comm
 from .clear_invalid import clear_invalid_route_slots, use_torch_clear
+from .fast_reduce import masked_topk_reduce, use_fast_reduce
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 
@@ -53,6 +54,12 @@ _KIND_TABLE: dict = {
 }
 
 TransformedBlockScaledWeights = Tuple[torch.Tensor, torch.Tensor]
+
+
+def _skip_vendored_topk_reduce(*_args, **_kwargs) -> None:
+    """Trace-time no-op standing in for the vendored ``TopkReduce`` launch: the shim
+    runs :func:`fast_reduce.masked_topk_reduce` after the megakernel instead."""
+    return None
 
 
 def _require_sm107() -> None:
@@ -409,6 +416,16 @@ class Sm107BlockScaledSymmBuffer:
         cfg = config
 
         kernel = self._build_kernel(cfg)
+        # The separate-reduce tail (vendored TopkReduce + the per-launch
+        # invalid-slot clear) is replaced by one masked Triton reduce that can also
+        # fuse an addend (the shared-expert output); see shim/fast_reduce.py.
+        self._fast_reduce = (
+            not cfg.reduce_topk_in_kernel
+            and use_fast_reduce()
+            and hasattr(kernel, "_topk_reduce")
+        )
+        if self._fast_reduce:
+            kernel._topk_reduce = _skip_vendored_topk_reduce
         self.kernel = kernel
 
         tokens = cfg.padded_tokens_per_rank
@@ -492,6 +509,10 @@ class Sm107BlockScaledSymmBuffer:
         self._staged_tokens: Optional[int] = None
         self._live_output_views: dict = {}
         self._destroyed = False
+        self._pre_reduced_bf16 = None
+        if self._fast_reduce and self._pre_reduced_activation is not None:
+            self._pre_reduced_bf16 = self._pre_reduced_activation.view(torch.bfloat16)
+        self._pending_reduce: Optional[int] = None
 
     @staticmethod
     def _build_kernel(cfg: Sm107BlockScaledMoeConfig):
@@ -594,6 +615,11 @@ class Sm107BlockScaledSymmBuffer:
     def staged_tokens(self) -> Optional[int]:
         return self._staged_tokens
 
+    @property
+    def fast_reduce(self) -> bool:
+        """True when the launch tail is the masked fused reduce (addend-capable)."""
+        return bool(getattr(self, "_fast_reduce", False))
+
     def _peer_mapper(self):
         from sources.communication.nvlink_domain.symmetric_buffer import (
             SymmetricBufferHost,
@@ -637,8 +663,21 @@ class Sm107BlockScaledSymmBuffer:
         self,
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
+        *,
+        addend: Optional[torch.Tensor] = None,
+        defer_reduce: bool = False,
     ) -> None:
-        """Compile on first use, then launch the fused mega kernel."""
+        """Compile on first use, then launch the fused mega kernel.
+
+        With the fast reduce (default), ``addend`` (BF16 ``[>= num_tokens, hidden]``)
+        is added to the reduced output in the same launch, and ``defer_reduce=True``
+        stops after the megakernel: call :meth:`finish_reduce` later on the same
+        stream (e.g. after joining a side stream that produced the addend)."""
+        if (addend is not None or defer_reduce) and not self.fast_reduce:
+            raise RuntimeError(
+                "addend / defer_reduce need the fast reduce "
+                "(separate reduce, FLASHINFER_SM107_MEGA_FAST_REDUCE != 0)"
+            )
         import cutlass.cute as cute
 
         if self._destroyed:
@@ -695,6 +734,9 @@ class Sm107BlockScaledSymmBuffer:
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the (live) output every launch.
             self.output_activation[:live].zero_()
+        elif self.fast_reduce:
+            # Invalid-route slots are masked inside the fused reduce: no clear.
+            pass
         else:
             # Invalid routes do not write a combine slot. Clear those slots on
             # every launch so a masked route cannot reuse an earlier result.
@@ -712,6 +754,27 @@ class Sm107BlockScaledSymmBuffer:
                     self.topk_idx, live, experts, self._pre_reduced_activation, 0
                 )
         self._compiled(**launch_kwargs)
+        if self.fast_reduce:
+            self._pending_reduce = live
+            if not defer_reduce:
+                self.finish_reduce(addend)
+
+    def finish_reduce(self, addend: Optional[torch.Tensor] = None) -> None:
+        """Masked top-k reduce of the last launch (+ ``addend``) into the output."""
+        live = self._pending_reduce
+        if live is None:
+            raise RuntimeError("finish_reduce() without a pending megakernel launch")
+        self._pending_reduce = None
+        cfg = self.config
+        masked_topk_reduce(
+            self._pre_reduced_bf16,
+            self.topk_idx,
+            live,
+            cfg.num_total_experts,
+            self.output_activation,
+            scores=None if cfg.apply_topk_at_fc1 else self.topk_weights,
+            addend=addend,
+        )
 
     def destroy(self) -> None:
         if self._destroyed:
@@ -726,6 +789,7 @@ class Sm107BlockScaledSymmBuffer:
         self._live_output_views = {}
         self._launch_weights = None
         self._pre_reduced_activation = None
+        self._pre_reduced_bf16 = None
         for name in ("x", "x_sf", "topk_weights", "shared_workspace"):
             comm.free_sym_tensor(getattr(self, name, None))
             setattr(self, name, None)
@@ -875,6 +939,8 @@ def sm107_block_scaled_mega_moe(
     num_tokens: Optional[int] = None,
     fast_math: bool = True,  # accepted for mega API parity; the kernel has no toggle
     sync: bool = False,
+    addend: Optional[torch.Tensor] = None,
+    defer_reduce: bool = False,
 ) -> Optional[torch.Tensor]:
     """Fused dispatch, FC1, SwiGLU/SiTU, FC2, and combine; writes ``y[:num_tokens]``.
 
@@ -921,7 +987,13 @@ def sm107_block_scaled_mega_moe(
         "fc2", transformed_l2, fc2_shape, fc2_sf, cfg, symm_buffer.device
     )
 
-    symm_buffer.launch(transformed_l1, transformed_l2)
+    if addend is not None and addend.shape[0] < num_tokens:
+        raise ValueError("addend must have at least num_tokens rows.")
+    if defer_reduce and y is not None:
+        raise ValueError("defer_reduce returns the workspace view; pass y=None.")
+    symm_buffer.launch(
+        transformed_l1, transformed_l2, addend=addend, defer_reduce=defer_reduce
+    )
     out = symm_buffer.output_activation[:num_tokens]
     if y is None:
         if sync:
@@ -931,6 +1003,14 @@ def sm107_block_scaled_mega_moe(
     if sync:
         torch.cuda.synchronize()
     return None
+
+
+def sm107_block_scaled_mega_finish_reduce(
+    symm_buffer: Sm107BlockScaledSymmBuffer, addend: Optional[torch.Tensor] = None
+) -> None:
+    """Run the reduce deferred by ``sm107_block_scaled_mega_moe(..., defer_reduce=True)``
+    (``+ addend``) on the current stream; the workspace view it returned is then valid."""
+    symm_buffer.finish_reduce(addend)
 
 
 def sm107_block_scaled_mega_launch_thunk(
@@ -961,5 +1041,6 @@ __all__ = [
     "TransformedBlockScaledWeights",
     "get_symm_buffer_for_sm107_block_scaled_mega_moe",
     "sm107_block_scaled_mega_launch_thunk",
+    "sm107_block_scaled_mega_finish_reduce",
     "sm107_block_scaled_mega_moe",
 ]

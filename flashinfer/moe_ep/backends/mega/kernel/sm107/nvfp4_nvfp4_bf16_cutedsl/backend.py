@@ -263,6 +263,8 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         transformed_weights: TransformedMegaWeights,
         *,
         output: torch.Tensor | None,
+        addend: torch.Tensor | None = None,
+        defer_reduce: bool = False,
     ) -> torch.Tensor:
         from ......kernel_src.sm107.next_cutedsl_megamoe import (
             sm107_block_scaled_mega_moe,
@@ -284,8 +286,19 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             workspace,
             num_tokens=num_tokens,
             fast_math=self._kernel_config.fast_math,
+            addend=addend,
+            defer_reduce=defer_reduce,
         )
         return output if output is not None else view
+
+    @staticmethod
+    def supports_fused_addend(workspace: Any) -> bool:
+        """True when ``compute(addend=..., defer_reduce=...)`` is available."""
+        return bool(getattr(workspace, "fast_reduce", False))
+
+    def finish_reduce(self, workspace: Any, addend: torch.Tensor | None = None) -> None:
+        """Complete a ``compute(..., defer_reduce=True)`` launch (``+ addend``)."""
+        workspace.finish_reduce(addend)
 
     def _workspace_pool_key(self, fleet_params: FleetParams):
         from ......core.kernel.workspace_pool import knobs_pool_key
