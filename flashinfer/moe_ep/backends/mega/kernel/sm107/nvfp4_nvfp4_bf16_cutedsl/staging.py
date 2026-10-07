@@ -12,7 +12,12 @@ def use_torch_stage() -> bool:
     return os.environ.get("FLASHINFER_SM107_MEGA_TORCH_STAGE", "0") == "1"
 
 
-def _fast_nvfp4_quantize(hidden_states: torch.Tensor, norm_const: float):
+def use_direct_stage() -> bool:
+    """``FLASHINFER_SM107_MEGA_DIRECT_STAGE=0`` restores quantize-then-copy staging."""
+    return os.environ.get("FLASHINFER_SM107_MEGA_DIRECT_STAGE", "1") != "0"
+
+
+def _fast_nvfp4_quantize(hidden_states: torch.Tensor, norm_const: float, out=None):
     """One-launch NVFP4 quantization (flashinfer CuTe-DSL kernel, linear E4M3 scales).
 
     The torch-composed ``quantize_nvfp4_block16`` materialises an 8-way fp32 distance
@@ -32,9 +37,36 @@ def _fast_nvfp4_quantize(hidden_states: torch.Tensor, norm_const: float):
     )
 
     q, sf = nvfp4_quantize_cute_dsl(
-        hidden_states, float(norm_const), sf_layout=SF_LAYOUT_LINEAR, nvfp4_4over6=None
+        hidden_states,
+        float(norm_const),
+        sf_layout=SF_LAYOUT_LINEAR,
+        nvfp4_4over6=None,
+        out=out,
     )
     return q, sf.reshape(hidden_states.shape[0], -1)
+
+
+def _direct_outputs(hidden_states, x_nvfp4, x_sf, hidden_sf_cols):
+    """Workspace destinations for a quantize-in-place staging, or None.
+
+    The packed rows ``x_nvfp4[:n]`` and the linear scale rows ``x_sf[:n]`` are written
+    by the quantizer itself (no DtoD copies) when the workspace scale plane has
+    exactly ``hidden / 16`` columns (then its flat prefix is the linear layout) and
+    holds the padded scale rows the TMA path writes (``round_up(n, 16)``)."""
+    if not use_direct_stage() or use_torch_stage():
+        return None
+    n = hidden_states.shape[0]
+    if (
+        x_sf.shape[1] != hidden_sf_cols
+        or not x_sf.is_contiguous()
+        or not x_nvfp4.is_contiguous()
+        or x_sf.shape[0] < ((n + 15) // 16) * 16
+    ):
+        return None
+    return (
+        x_nvfp4[:n].view(torch.uint8),
+        x_sf.view(torch.uint8).view(-1),
+    )
 
 
 def stage_mega_moe_inputs(
@@ -73,14 +105,6 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    fast = _fast_nvfp4_quantize(hidden_states, input_norm_const)
-    if fast is not None:
-        q, sf = fast
-    else:
-        q, sf = quantize_nvfp4_block16(
-            hidden_states.to(torch.float32), norm_const=input_norm_const
-        )
-
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     if x_sf.shape[1] < hidden_sf_cols:
         raise ValueError(
@@ -88,10 +112,24 @@ def stage_mega_moe_inputs(
             f"{hidden_sf_cols}."
         )
 
-    x_nvfp4[:num_tokens].view(torch.uint8).copy_(q.view(torch.uint8))
-    if x_sf.shape[1] != hidden_sf_cols:
-        x_sf[:num_tokens].view(torch.uint8).zero_()
-    x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
+    direct = _direct_outputs(hidden_states, x_nvfp4, x_sf, hidden_sf_cols)
+    fast = (
+        _fast_nvfp4_quantize(hidden_states, input_norm_const, out=direct)
+        if direct is not None
+        else None
+    )
+    if fast is None:
+        fast = _fast_nvfp4_quantize(hidden_states, input_norm_const)
+        if fast is not None:
+            q, sf = fast
+        else:
+            q, sf = quantize_nvfp4_block16(
+                hidden_states.to(torch.float32), norm_const=input_norm_const
+            )
+        x_nvfp4[:num_tokens].view(torch.uint8).copy_(q.view(torch.uint8))
+        if x_sf.shape[1] != hidden_sf_cols:
+            x_sf[:num_tokens].view(torch.uint8).zero_()
+        x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
     if not routes_staged:
         topk_idx_out[:num_tokens].copy_(topk_ids.to(torch.int32))
         topk_weights_out[:num_tokens].copy_(topk_weights.to(torch.float32))
