@@ -34,6 +34,7 @@ import torch
 
 from . import comm
 from .dependencies import require_sm107_dsl
+from .fast_reduce import masked_topk_reduce
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 
 Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
@@ -52,6 +53,12 @@ _KIND_TABLE: dict = {
 }
 
 TransformedBlockScaledWeights = Tuple[torch.Tensor, torch.Tensor]
+
+
+def _skip_vendored_topk_reduce(*_args, **_kwargs) -> None:
+    """Trace-time no-op standing in for the vendored ``TopkReduce`` launch: the shim
+    runs :func:`fast_reduce.masked_topk_reduce` after the megakernel instead."""
+    return None
 
 
 def _require_sm107() -> None:
@@ -400,6 +407,17 @@ class Sm107BlockScaledSymmBuffer:
         cfg = config
 
         kernel = self._build_kernel(cfg)
+        # NVFP4 with the separate reduce: the launch tail (the clear of invalid
+        # combine slots plus the vendored TopkReduce, both over the whole capacity)
+        # is replaced by one masked Triton reduce over the staged rows; see
+        # shim/fast_reduce.py. The other kinds keep the vendored tail.
+        self._fast_reduce = (
+            cfg.quant_kind == "nvfp4"
+            and not cfg.reduce_topk_in_kernel
+            and hasattr(kernel, "_topk_reduce")
+        )
+        if self._fast_reduce:
+            kernel._topk_reduce = _skip_vendored_topk_reduce
         self.kernel = kernel
 
         tokens = cfg.padded_tokens_per_rank
@@ -584,6 +602,11 @@ class Sm107BlockScaledSymmBuffer:
     def staged_tokens(self) -> Optional[int]:
         return self._staged_tokens
 
+    @property
+    def fast_reduce(self) -> bool:
+        """True when the launch tail is the masked top-k reduce over the staged rows."""
+        return bool(getattr(self, "_fast_reduce", False))
+
     def _peer_mapper(self):
         from sources.communication.nvlink_domain.symmetric_buffer import (
             SymmetricBufferHost,
@@ -662,6 +685,9 @@ class Sm107BlockScaledSymmBuffer:
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
+        elif self.fast_reduce:
+            # Invalid-route slots are masked inside the reduce below: no clear.
+            pass
         else:
             # Invalid routes do not write a combine slot. Clear those slots on
             # every launch so a masked route cannot reuse an earlier result.
@@ -670,6 +696,22 @@ class Sm107BlockScaledSymmBuffer:
             )
             self._pre_reduced_activation.masked_fill_(invalid.unsqueeze(-1), 0)
         self._compiled(**self._launch_kwargs)
+        if self.fast_reduce:
+            # Reduce only the staged rows (callers read output[:num_tokens]); the
+            # whole capacity when no staging was recorded, nothing for an empty
+            # batch.
+            capacity = self.output_activation.shape[0]
+            staged = self._staged_tokens
+            live = capacity if staged is None else min(int(staged), capacity)
+            cfg = self.config
+            masked_topk_reduce(
+                self._pre_reduced_activation,
+                self.topk_idx,
+                live,
+                cfg.num_total_experts,
+                self.output_activation,
+                scores=None if cfg.apply_topk_at_fc1 else self.topk_weights,
+            )
 
     def destroy(self) -> None:
         if self._destroyed:
