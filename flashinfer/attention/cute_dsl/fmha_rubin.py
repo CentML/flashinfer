@@ -73,10 +73,10 @@ def _scales(scale_q, scale_k, scale_v, scale_o, sm_scale, head_dim):
 _GQA_Q_ROWS_PER_CTA = 256  # mma_tiler M (128) x 2 O tiles per CTA
 
 #: Paged-GQA kernel options measured fastest for Qwen3-VL on VR200 with the
-#: DKG 0b1b22d0 exports: cluster launch with CLC Work IDs for TMA stores
+#: current DKG exports: cluster launch with CLC Work IDs for TMA stores
 #: (static scheduling for direct stores), no softmax sequence barrier, the
 #: default skip-correction threshold, the MMA row sum and the packed NVFP4
-#: epilogue (ignored for BF16 output). The cutedsl_attn_50a719 reference used
+#: epilogue (ignored for BF16 output). An older reference build used
 #: threshold 0, which is slower on this kernel body. Pass as
 #: ``cute_dsl_fmha_paged_prefill(..., **RUBIN_GQA_TUNED_POLICY)``.
 RUBIN_GQA_TUNED_POLICY = MappingProxyType(
@@ -134,10 +134,10 @@ def _load_kernel(q, varlen=True, *, is_persistent=False, **kwargs):
 
 # Persistent ViT policy measured on Rubin (212 SMs) for Qwen3-VL (16 heads,
 # logical D72) under encoder CUDA graphs: the MMA row-sum exports are 2-3%
-# faster than the REF 50a719 policy at lower error, and static Work-ID
-# strides beat the dynamic queue up to 8192 tokens of graph capacity (the
-# queue wins above, as in REF). Pass a [tokens, heads, 72] output as well to
-# avoid the D80 -> D72 crop copy.
+# faster than the reference build's policy at lower error, and static
+# Work-ID strides beat the dynamic queue up to 8192 tokens of graph capacity
+# (the queue wins above, as in the reference build). Pass a
+# [tokens, heads, 72] output as well to avoid the D80 -> D72 crop copy.
 RUBIN_VIT_TUNED_POLICY = {"persistent": True, "mma_rowsum": True}
 _RUBIN_VIT_STATIC_WORK_MAX_TOKENS = 8192
 
