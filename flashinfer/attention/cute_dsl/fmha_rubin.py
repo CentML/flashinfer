@@ -25,6 +25,8 @@ the matching cubin_publishing build; this module does not invent a future pin.
 
 import math
 import os
+from collections.abc import Sequence
+from types import MappingProxyType
 
 import torch
 from cutlass.cute.typing import Float32, Int32
@@ -65,6 +67,47 @@ def _scales(scale_q, scale_k, scale_v, scale_o, sm_scale, head_dim):
     )
     output = _positive_scalar(scale_v, "scale_v") / _positive_scalar(scale_o, "scale_o")
     return Float32(qk * math.log2(math.e)), Float32(qk), Float32(output)
+
+
+_GQA_Q_ROWS_PER_CTA = 256  # mma_tiler M (128) x 2 O tiles per CTA
+
+#: Paged-GQA kernel options measured fastest for Qwen3-VL on VR200 with the
+#: DKG 0b1b22d0 exports: cluster launch with CLC Work IDs for TMA stores
+#: (static scheduling for direct stores), no softmax sequence barrier, the
+#: default skip-correction threshold, the MMA row sum and the packed NVFP4
+#: epilogue (ignored for BF16 output). The cutedsl_attn_50a719 reference used
+#: threshold 0, which is slower on this kernel body. Pass as
+#: ``cute_dsl_fmha_paged_prefill(..., **RUBIN_GQA_TUNED_POLICY)``.
+RUBIN_GQA_TUNED_POLICY = MappingProxyType(
+    {
+        "scheduler": "auto",
+        "sequence_barrier": False,
+        "mma_rowsum": True,
+        "packed_nvfp4_epilogue": True,
+    }
+)
+
+
+def rubin_paged_prefill_query_layout(
+    query_lens: Sequence[int], *, fp4_output: bool = True
+) -> tuple[str, str]:
+    """Pick ``(query_layout, output_store)`` from host query lengths.
+
+    Measured order for the tuned exports: the uniform layout when two or more
+    requests have equal lengths; otherwise packed ragged TMA for NVFP4
+    output, or for BF16 output packed dense TMA when every request but the
+    last fills whole 256-row Q tiles, else direct stores.
+    """
+    lens = tuple(int(n) for n in query_lens)
+    if not lens or min(lens) <= 0:
+        raise ValueError("query_lens must be a nonempty list of positive lengths")
+    if len(lens) > 1 and all(n == lens[0] for n in lens):
+        return "uniform", "tma"
+    if fp4_output:
+        return "packed", "ragged_tma"
+    if all(n % _GQA_Q_ROWS_PER_CTA == 0 for n in lens[:-1]):
+        return "packed", "tma"
+    return "packed", "direct"
 
 
 def _load_kernel(q, varlen=True, **kwargs):
@@ -244,7 +287,8 @@ def cute_dsl_fmha_paged_prefill(
     ``query_layout="uniform"`` views Q/O as ``[batch, max_q_len, ...]``
     without ``qo_indptr`` (every request has ``max_q_len`` query tokens;
     checked as ``batch * max_q_len == total_q``) and always stores O through
-    TMA.
+    TMA. :func:`rubin_paged_prefill_query_layout` picks the layout and store
+    from host query lengths.
 
     ``scheduler``, ``sequence_barrier``, ``rescale_threshold``,
     ``mma_rowsum`` and ``packed_nvfp4_epilogue`` select exports built with
@@ -254,8 +298,8 @@ def cute_dsl_fmha_paged_prefill(
     with cluster launch; ``"clc"`` Rubin hardware CLC Work IDs (page size 16
     with a TMA output store); ``"auto"`` is ``"clc"`` where allowed and
     ``"cluster"`` otherwise. ``packed_nvfp4_epilogue`` applies to NVFP4 output
-    only and is ignored for BF16. The defaults load the same exports as
-    before.
+    only and is ignored for BF16. :data:`RUBIN_GQA_TUNED_POLICY` holds the
+    measured-best settings. The defaults load the same exports as before.
 
     Warm up this explicit AOT-only path before CUDA graph capture. Missing
     specializations raise instead of falling back to BF16 or public JIT.

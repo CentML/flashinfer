@@ -83,7 +83,9 @@ def load_functions(relative_path, names=None):
     tree.body = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and (names is None or node.name in names)
+        if (isinstance(node, ast.FunctionDef) and (names is None or node.name in names))
+        # Module constants used by the wrappers (whole-module loads only).
+        or (names is None and isinstance(node, ast.Assign))
     ]
     ns = {
         "torch": TORCH,
@@ -92,6 +94,8 @@ def load_functions(relative_path, names=None):
         "Float32": float,
         "Int32": int,
         "Optional": __import__("typing").Optional,
+        "Sequence": __import__("collections.abc").abc.Sequence,
+        "MappingProxyType": __import__("types").MappingProxyType,
         "DSL_FMHA_ARTIFACT_PATH": "a10580e7/fmha/cute-dsl/",
         "_get_gpu_arch": lambda _: "sm_107a",
     }
@@ -236,6 +240,29 @@ class RubinFmhaContractTest(unittest.TestCase):
         self.assertFalse(selection["use_packed_nvfp4_epilogue"])
         with self.assertRaisesRegex(ValueError, "ragged_tma for NVFP4"):
             self.paged(output_store="ragged_tma", **bf16)
+
+    def test_tuned_policy_selects_tuned_exports(self):
+        self.paged(**self.ns["RUBIN_GQA_TUNED_POLICY"])
+        selection = self.selection[0][1]
+        self.assertEqual(selection["scheduler"], "clc")
+        self.assertTrue(selection["use_ragged_tma"])
+        self.assertTrue(selection["disable_sequence_barrier"])
+        self.assertIsNone(selection["rescale_threshold"])
+        self.assertTrue(selection["use_mma_rowsum"])
+        self.assertTrue(selection["use_packed_nvfp4_epilogue"])
+
+    def test_query_layout_selection(self):
+        pick = self.ns["rubin_paged_prefill_query_layout"]
+        self.assertEqual(pick([3109]), ("packed", "ragged_tma"))
+        self.assertEqual(pick([256] * 84), ("uniform", "tma"))
+        self.assertEqual(pick([2688] * 8), ("uniform", "tma"))
+        self.assertEqual(pick([1] * 128), ("uniform", "tma"))
+        self.assertEqual(pick([3109, 777, 64]), ("packed", "ragged_tma"))
+        self.assertEqual(pick([3109], fp4_output=False), ("packed", "tma"))
+        self.assertEqual(pick([512, 1024, 77], fp4_output=False), ("packed", "tma"))
+        self.assertEqual(pick([3109, 777], fp4_output=False), ("packed", "direct"))
+        with self.assertRaises(ValueError):
+            pick([])
 
     def test_vit_uses_logical_dimension_and_token_indptr(self):
         q, k, v = [Tensor((193, 16, 80)) for _ in range(3)]
