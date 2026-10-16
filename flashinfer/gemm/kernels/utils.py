@@ -197,6 +197,8 @@ def _score_block_scaled_tactic(
 def _rank_mm_fp4_autotune_tactics(valid_tactics, m, n, real_k, sm_count, max_tactics):
     """Rank and return at most ``max_tactics`` actual mm_fp4 tactics.
 
+    ``max_tactics=None`` returns every tactic, still ranked best-first.
+
     SM100 has two tactics per structural configuration because
     ``use_prefetch`` is a Boolean. SM103 and SM107 encode their architecture
     knobs in the final tuple field and usually have one tactic per grouping

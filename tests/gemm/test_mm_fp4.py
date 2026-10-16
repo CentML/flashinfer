@@ -712,6 +712,40 @@ def test_mm_fp4_per_token_alpha_low_m_untuned(m, n, k, res_dtype):
     _check_per_token_alpha_untuned(m, n, k, res_dtype)
 
 
+def test_mm_fp4_cute_dsl_max_tactics_env(monkeypatch):
+    """FLASHINFER_MM_FP4_CUTE_DSL_MAX_TACTICS sets how many analytically
+    ranked cute-dsl tactics the autotuner profiles; 0 profiles all of them."""
+    from flashinfer.gemm.gemm_base import (
+        _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS,
+        _get_mm_fp4_cute_dsl_max_tuning_configs,
+    )
+    from flashinfer.gemm.kernels.utils import _rank_mm_fp4_autotune_tactics
+
+    env = "FLASHINFER_MM_FP4_CUTE_DSL_MAX_TACTICS"
+    monkeypatch.delenv(env, raising=False)
+    assert _get_mm_fp4_cute_dsl_max_tuning_configs() == 32
+    assert _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS == 32
+    for value, expected in (("", 32), (" 64 ", 64), ("4", 4), ("0", None)):
+        monkeypatch.setenv(env, value)
+        assert _get_mm_fp4_cute_dsl_max_tuning_configs() == expected, value
+    for value in ("-1", "1.5", "all"):
+        monkeypatch.setenv(env, value)
+        with pytest.raises(ValueError, match=env):
+            _get_mm_fp4_cute_dsl_max_tuning_configs()
+
+    # Every budget keeps the same best-first order; None keeps every tactic.
+    tactics = [
+        (tile, (1, 1), swap_ab, False, "sm100", None)
+        for tile in ((128, 64), (128, 128), (256, 128), (128, 256), (256, 256))
+        for swap_ab in (False, True)
+    ]
+    m, n, real_k, sm_count = 16384, 4096, 8192, 148
+    ranked = _rank_mm_fp4_autotune_tactics(tactics, m, n, real_k, sm_count, None)
+    assert len(ranked) == len(tactics) and set(ranked) == set(tactics)
+    top4 = _rank_mm_fp4_autotune_tactics(tactics, m, n, real_k, sm_count, 4)
+    assert top4 == ranked[:4]
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
 

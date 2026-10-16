@@ -6248,8 +6248,47 @@ def _cudnn_mm_mxfp8_requirement(
 _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
-# Max distinct configs the autotuner profiles mm_fp4(backend='cute-dsl')
+# Max distinct configs the autotuner profiles mm_fp4(backend='cute-dsl'),
+# taken in analytical-rank order. FLASHINFER_MM_FP4_CUTE_DSL_MAX_TACTICS
+# overrides it (see _get_mm_fp4_cute_dsl_max_tuning_configs).
 _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS = 32
+_MM_FP4_CUTE_DSL_MAX_TACTICS_ENV = "FLASHINFER_MM_FP4_CUTE_DSL_MAX_TACTICS"
+
+
+@functools.cache
+def _parse_mm_fp4_cute_dsl_max_tactics(value: str) -> Optional[int]:
+    # Cached per value so an override is validated and logged once.
+    if not value.isdecimal():
+        raise ValueError(
+            f"{_MM_FP4_CUTE_DSL_MAX_TACTICS_ENV} must be a non-negative integer "
+            f"(0 = profile every valid tactic), got {value!r}"
+        )
+    max_tactics = int(value)
+    if max_tactics != _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS:
+        # A warning so the non-default tuning budget shows up in host logs
+        # that do not configure FlashInfer's loggers.
+        scope = "every valid tactic" if max_tactics == 0 else f"the top {max_tactics}"
+        logger.warning(
+            f"[mm_fp4 cute-dsl] {_MM_FP4_CUTE_DSL_MAX_TACTICS_ENV}={max_tactics}: "
+            f"autotuning profiles {scope} instead of the top "
+            f"{_MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS} tactics by analytical rank."
+        )
+    return max_tactics or None
+
+
+def _get_mm_fp4_cute_dsl_max_tuning_configs() -> Optional[int]:
+    """Autotuning budget of mm_fp4(backend='cute-dsl'), or None for no limit.
+
+    The autotuner profiles this many valid tactics, best analytical rank
+    first. FLASHINFER_MM_FP4_CUTE_DSL_MAX_TACTICS overrides the default
+    _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS; 0 profiles every valid tactic, at
+    the cost of longer tuning. Read when tactics are enumerated, so it must
+    match on every rank of an autotune process group.
+    """
+    value = os.environ.get(_MM_FP4_CUTE_DSL_MAX_TACTICS_ENV, "").strip()
+    if not value:
+        return _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS
+    return _parse_mm_fp4_cute_dsl_max_tactics(value)
 
 
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
@@ -8581,7 +8620,7 @@ def _cute_dsl_gemm_fp4_runner(
                 n,
                 real_k,
                 sm_count,
-                _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS,
+                _get_mm_fp4_cute_dsl_max_tuning_configs(),
             )
 
         def forward(
