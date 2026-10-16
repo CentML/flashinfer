@@ -133,8 +133,19 @@ def _get_variant_name(
     num_q_heads: Optional[int] = None,
     use_fp16_softmax: bool = False,
     use_ragged_tma: bool = False,
+    use_dense_tma: bool = False,
+    scheduler: Optional[str] = None,
+    disable_sequence_barrier: bool = False,
+    rescale_threshold: Optional[float] = None,
+    use_mma_rowsum: bool = False,
+    use_packed_nvfp4_epilogue: bool = False,
 ) -> str:
-    """Generate the variant name matching compile_cute_dsl_fmha.py naming convention."""
+    """Generate the variant name matching compile_cute_dsl_fmha.py naming convention.
+
+    The paged-GQA policy fields (``use_dense_tma`` to ``use_packed_nvfp4_epilogue``) add
+    suffixes only when they differ from the defaults, so existing names are
+    unchanged.
+    """
     qk_str = _dtype_to_str(qk_dtype)
     pv_str = _dtype_to_str(pv_dtype)
     out_str = _dtype_to_str(out_dtype)
@@ -157,13 +168,27 @@ def _get_variant_name(
     paged_str = f"_paged{page_size}" if page_size is not None else ""
     layout_str = "_hnd" if page_size is not None and kv_layout == "HND" else ""
     heads_str = f"_qh{num_q_heads}" if num_q_heads is not None else ""
-    ragged_tma_str = "_raggedtma" if use_ragged_tma else ""
+    if use_ragged_tma and use_dense_tma:
+        raise ValueError("use_ragged_tma and use_dense_tma are exclusive")
+    store_str = "_raggedtma" if use_ragged_tma else "_densetma" if use_dense_tma else ""
+    if scheduler not in (None, "cluster", "clc"):
+        raise ValueError(f"Unknown FMHA scheduler {scheduler!r}")
+    sched_str = f"_{scheduler}" if scheduler else ""
+    sb_str = "_nosb" if disable_sequence_barrier else ""
+    rt_str = (
+        "_rt" + f"{rescale_threshold:g}".replace(".", "p")
+        if rescale_threshold is not None
+        else ""
+    )
+    rowsum_str = "_rowsum" if use_mma_rowsum else ""
+    sfpack_str = "_sfpack" if use_packed_nvfp4_epilogue else ""
     fp16sm_str = "_fp16sm" if use_fp16_softmax else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
     return (
         f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}"
         f"{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}"
-        f"{paged_str}{layout_str}{heads_str}{ragged_tma_str}{fp16sm_str}{ffi_str}"
+        f"{paged_str}{layout_str}{heads_str}{store_str}"
+        f"{sched_str}{sb_str}{rt_str}{rowsum_str}{sfpack_str}{fp16sm_str}{ffi_str}"
     )
 
 
@@ -266,6 +291,12 @@ def get_cute_dsl_fmha_kernel(
     num_q_heads: Optional[int] = None,
     use_fp16_softmax: bool = False,
     use_ragged_tma: bool = False,
+    use_dense_tma: bool = False,
+    scheduler: Optional[str] = None,
+    disable_sequence_barrier: bool = False,
+    rescale_threshold: Optional[float] = None,
+    use_mma_rowsum: bool = False,
+    use_packed_nvfp4_epilogue: bool = False,
 ):
     """Get a compiled DSL FMHA kernel function.
 
@@ -298,6 +329,21 @@ def get_cute_dsl_fmha_kernel(
         Tensor args accept torch.Tensor directly, stream uses env stream.
     enable_skip_softmax : bool
         If True, load kernel compiled with skip-softmax support.
+    use_dense_tma : bool
+        Packed (varlen) Q with dense TMA output stores (``_densetma``).
+    scheduler : Optional[str]
+        ``None`` (legacy launch), ``"cluster"`` (static scheduler, cluster
+        launch) or ``"clc"`` (Rubin hardware CLC Work IDs).
+    disable_sequence_barrier : bool
+        Load the export built without the softmax sequence barrier (``_nosb``).
+    rescale_threshold : Optional[float]
+        Skip-correction threshold the export was built with (``_rt<value>``);
+        ``None`` is the exporter default.
+    use_mma_rowsum : bool
+        Load the export whose online row sum uses the auxiliary MMA.
+    use_packed_nvfp4_epilogue : bool
+        Load the NVFP4 export whose epilogue folds 1/row_sum into the block
+        scale and stores four Layout128x4 scales per 32-bit store (``_sfpack``).
 
     Returns
     -------
@@ -322,6 +368,12 @@ def get_cute_dsl_fmha_kernel(
         num_q_heads=num_q_heads,
         use_fp16_softmax=use_fp16_softmax,
         use_ragged_tma=use_ragged_tma,
+        use_dense_tma=use_dense_tma,
+        scheduler=scheduler,
+        disable_sequence_barrier=disable_sequence_barrier,
+        rescale_threshold=rescale_threshold,
+        use_mma_rowsum=use_mma_rowsum,
+        use_packed_nvfp4_epilogue=use_packed_nvfp4_epilogue,
     )
 
     # Check for local .so directory (development mode)

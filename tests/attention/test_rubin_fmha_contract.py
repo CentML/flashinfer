@@ -243,6 +243,71 @@ class RubinFmhaContractTest(unittest.TestCase):
             name,
             "cute_dsl_fmha_e4m3_bf16_h72_nocausal_nonpersistent_varlen_fp16sm_tvmffi",
         )
+        gqa = dict(
+            enable_tvm_ffi=True,
+            use_pdl=True,
+            page_size=16,
+            kv_layout="HND",
+            use_fp16_softmax=True,
+            disable_sequence_barrier=True,
+            rescale_threshold=0.0,
+        )
+        prefix = "cute_dsl_fmha_e4m3_e2m1_h128_causal_nonpersistent"
+        for kwargs, suffix in (
+            (
+                dict(varlen=True, use_ragged_tma=True, scheduler="clc"),
+                "_varlen_pdl_paged16_hnd_qh64_raggedtma_clc_nosb_rt0_fp16sm_tvmffi",
+            ),
+            (
+                dict(varlen=True, use_dense_tma=True, scheduler="clc"),
+                "_varlen_pdl_paged16_hnd_qh64_densetma_clc_nosb_rt0_fp16sm_tvmffi",
+            ),
+            (
+                dict(varlen=False, scheduler="clc"),
+                "_pdl_paged16_hnd_qh64_clc_nosb_rt0_fp16sm_tvmffi",
+            ),
+            (
+                dict(varlen=True, scheduler="cluster"),
+                "_varlen_pdl_paged16_hnd_qh64_cluster_nosb_rt0_fp16sm_tvmffi",
+            ),
+        ):
+            name = names["_get_variant_name"](
+                "e4m3",
+                "e4m3",
+                "uint8",
+                128,
+                True,
+                False,
+                num_q_heads=64,
+                **gqa,
+                **kwargs,
+            )
+            self.assertEqual(name, prefix + suffix)
+        name = names["_get_variant_name"](
+            "e4m3",
+            "e4m3",
+            "uint8",
+            128,
+            True,
+            False,
+            varlen=True,
+            enable_tvm_ffi=True,
+            use_pdl=True,
+            page_size=16,
+            kv_layout="HND",
+            num_q_heads=64,
+            use_fp16_softmax=True,
+            use_ragged_tma=True,
+            scheduler="clc",
+            disable_sequence_barrier=True,
+            use_mma_rowsum=True,
+            use_packed_nvfp4_epilogue=True,
+        )
+        self.assertEqual(
+            name,
+            prefix
+            + "_varlen_pdl_paged16_hnd_qh64_raggedtma_clc_nosb_rowsum_sfpack_fp16sm_tvmffi",
+        )
 
 
 if __name__ == "__main__":
