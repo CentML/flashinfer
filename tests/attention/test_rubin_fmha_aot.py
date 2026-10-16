@@ -169,6 +169,57 @@ def test_rubin_vit_d72_persistent_aot(dynamic, mma_rowsum):
     assert torch.all(o[active:] == -17)
 
 
+@pytest.mark.parametrize("mma_rowsum", [False, True])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_rubin_vit_d72_persistent_logical_output_aot(dynamic, mma_rowsum):
+    """A compact [tokens, heads, 72] output equals the D80 output's first 72."""
+    if not os.environ.get("FLASHINFER_DSL_FMHA_LOCAL_DIR"):
+        pytest.skip("Requires locally exported persistent ViT artifacts")
+    torch.manual_seed(199)
+    lengths = [300, 0, 1024, 17, 0, 0]
+    active = sum(lengths)
+    capacity = active + 64
+    tensors = []
+    for _ in range(3):
+        padded = torch.zeros((capacity, 16, 80), device="cuda")
+        padded[:active, :, :72] = torch.randn((active, 16, 72), device="cuda") * 0.5
+        tensors.append(padded.to(torch.float8_e4m3fn))
+    q, k, v = tensors
+    o80 = torch.zeros(q.shape, dtype=torch.bfloat16, device="cuda")
+    o72 = torch.full((capacity, 16, 72), -17.0, dtype=torch.bfloat16, device="cuda")
+    indptr = _indptr(lengths)
+    work = cute_dsl_fmha_vit_work_count(lengths, 16)
+    counter = None
+    if dynamic:
+        counter = torch.tensor([0, work], dtype=torch.int32, device="cuda")
+
+    def run(o):
+        for _ in range(2):
+            cute_dsl_fmha_vit(
+                q,
+                k,
+                v,
+                o,
+                indptr,
+                capacity,
+                scale_q=0.5,
+                scale_k=0.25,
+                scale_v=2.0,
+                persistent=True,
+                work_counter=counter,
+                mma_rowsum=mma_rowsum,
+            )
+
+    run(o80)
+    _graph_replay(lambda: run(o72), o72[:active])
+    if dynamic:
+        assert counter.tolist() == [0, work]
+    # Same kernel body and store order: the D72 rows are bit-identical, and
+    # neither the padding columns nor the unused tail rows are written.
+    assert torch.equal(o72[:active], o80[:active, ..., :72])
+    assert torch.all(o72[active:] == -17)
+
+
 @pytest.mark.parametrize(
     "fp4,output_store", [(False, "direct"), (True, "direct"), (True, "ragged_tma")]
 )

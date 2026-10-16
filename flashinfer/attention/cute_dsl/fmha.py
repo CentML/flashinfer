@@ -140,6 +140,7 @@ def _get_variant_name(
     use_mma_rowsum: bool = False,
     use_packed_nvfp4_epilogue: bool = False,
     use_dynamic_work_scheduler: bool = False,
+    logical_output: bool = False,
 ) -> str:
     """Generate the variant name matching compile_cute_dsl_fmha.py naming convention.
 
@@ -184,13 +185,16 @@ def _get_variant_name(
     )
     rowsum_str = "_rowsum" if use_mma_rowsum else ""
     sfpack_str = "_sfpack" if use_packed_nvfp4_epilogue else ""
+    # Compact output at the logical head dimension (e.g. D72 for D80 storage).
+    out_str_logical = f"_o{head_dim}" if logical_output else ""
     fp16sm_str = "_fp16sm" if use_fp16_softmax else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
     return (
         f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}"
         f"{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}"
         f"{paged_str}{layout_str}{heads_str}{dynwork_str}{store_str}"
-        f"{sched_str}{sb_str}{rt_str}{rowsum_str}{sfpack_str}{fp16sm_str}{ffi_str}"
+        f"{sched_str}{sb_str}{rt_str}{rowsum_str}{sfpack_str}{out_str_logical}"
+        f"{fp16sm_str}{ffi_str}"
     )
 
 
@@ -300,6 +304,7 @@ def get_cute_dsl_fmha_kernel(
     use_mma_rowsum: bool = False,
     use_packed_nvfp4_epilogue: bool = False,
     use_dynamic_work_scheduler: bool = False,
+    logical_output: bool = False,
 ):
     """Get a compiled DSL FMHA kernel function.
 
@@ -351,6 +356,10 @@ def get_cute_dsl_fmha_kernel(
         If True, load the persistent variant that takes Work IDs from a
         global queue (``_dynwork``). Its last call argument is the CUDA
         ``int32[2]`` counter ``[next_work_idx, total_work]``.
+    logical_output : bool
+        If True, load the variant whose output is a compact tensor at the
+        logical head dimension (``_o<head_dim>``) rather than the padded
+        storage width.
 
     Returns
     -------
@@ -382,6 +391,7 @@ def get_cute_dsl_fmha_kernel(
         use_mma_rowsum=use_mma_rowsum,
         use_packed_nvfp4_epilogue=use_packed_nvfp4_epilogue,
         use_dynamic_work_scheduler=use_dynamic_work_scheduler,
+        logical_output=logical_output,
     )
 
     # Check for local .so directory (development mode)

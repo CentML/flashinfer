@@ -175,6 +175,10 @@ def cute_dsl_fmha_vit(
 
     ``q/k/v`` are compact E4M3 tensors [total_tokens, heads, 80]; ``o`` has
     the same shape and BF16 dtype. Only its first 72 channels are defined.
+    With ``persistent=True``, ``o`` may instead be a compact BF16
+    [total_tokens, heads, 72] tensor: the kernel then writes the logical
+    width directly, so ``o.view(total_tokens, heads * 72)`` needs no D80 to
+    D72 crop copy.
     Input padding must be zero. ``qo_indptr`` contains CUDA int32 cumulative
     TOKEN counts (not cuDNN element offsets), shared by self-attention Q/K/V.
     The default softmax scale uses logical D72, never padded D80.
@@ -209,9 +213,14 @@ def cute_dsl_fmha_vit(
         _require_tensor(tensor, name, q.device, torch.float8_e4m3fn, 3)
     _require_tensor(o, "o", q.device, torch.bfloat16, 3, align=32)
     _require_tensor(qo_indptr, "qo_indptr", q.device, torch.int32, 1)
-    if q.shape != k.shape or q.shape != v.shape or q.shape != o.shape:
-        raise ValueError("ViT q/k/v/o must have identical padded shapes")
+    if q.shape != k.shape or q.shape != v.shape or q.shape[:2] != o.shape[:2]:
+        raise ValueError("ViT q/k/v/o must have identical token and head extents")
     total, heads, storage = q.shape
+    logical_output = o.shape[2] == logical_head_dim
+    if o.shape[2] != storage and not logical_output:
+        raise ValueError("ViT o must have the padded D80 or the logical D72 width")
+    if logical_output and not persistent:
+        raise ValueError("A logical-width D72 output requires persistent=True")
     if storage != 80 or total <= 0 or heads <= 0 or qo_indptr.numel() < 2:
         raise ValueError(
             "ViT requires positive tokens/heads, D80, and a nonempty batch"
@@ -238,11 +247,13 @@ def cute_dsl_fmha_vit(
         use_ragged_tma=persistent,
         use_dynamic_work_scheduler=work_counter is not None,
         use_mma_rowsum=mma_rowsum,
+        logical_output=logical_output,
     )
     scale_log2, scale_sm, scale_out = _scales(
         scale_q, scale_k, scale_v, scale_o, sm_scale, logical_head_dim
     )
     shape = (1, total, heads, 1, storage)
+    o_shape = (1, total, heads, 1, o.shape[2])
     problem = (
         qo_indptr.numel() - 1,
         max_seqlen,
@@ -257,7 +268,7 @@ def cute_dsl_fmha_vit(
         q.view(shape),
         k.view(shape),
         v.view(shape),
-        o.view(shape),
+        o.view(o_shape),
         problem,
         qo_indptr,
         qo_indptr,
