@@ -55,6 +55,7 @@ from .fp4_common import (
     st_global_u64,
     get_ptr_as_int64,
     get_smem_ptr_as_int32,
+    ld_global_v4_u32,
     ld_shared_v4_u32,
     rcp_approx_ftz,
     fmin_f32,
@@ -112,6 +113,32 @@ def _load_8_half2_from_smem(
     w_addr1 = get_smem_ptr_as_int32(sW, base + Int32(8))
     w_h2[0], w_h2[1], w_h2[2], w_h2[3] = ld_shared_v4_u32(w_addr0)
     w_h2[4], w_h2[5], w_h2[6], w_h2[7] = ld_shared_v4_u32(w_addr1)
+    return x_h2, w_h2
+
+
+@cute.jit
+def _load_8_half2_from_smem_and_gmem(
+    sX: cute.Tensor,
+    mW: cute.Tensor,
+    row_idx: Int32,
+    smem_col: Int32,
+    gmem_col: Int32,
+    row_stride: int,
+):
+    """Load 16 packed fp16/bf16 values of X from shared and of W from global memory."""
+    x_h2 = cute.make_rmem_tensor((8,), Uint32)
+    w_h2 = cute.make_rmem_tensor((8,), Uint32)
+    base = row_idx * row_stride + smem_col
+
+    x_addr0 = get_smem_ptr_as_int32(sX, base)
+    x_addr1 = get_smem_ptr_as_int32(sX, base + Int32(8))
+    x_h2[0], x_h2[1], x_h2[2], x_h2[3] = ld_shared_v4_u32(x_addr0)
+    x_h2[4], x_h2[5], x_h2[6], x_h2[7] = ld_shared_v4_u32(x_addr1)
+
+    w_ptr0 = get_ptr_as_int64(mW, gmem_col)
+    w_ptr1 = get_ptr_as_int64(mW, gmem_col + Int32(8))
+    w_h2[0], w_h2[1], w_h2[2], w_h2[3] = ld_global_v4_u32(w_ptr0)
+    w_h2[4], w_h2[5], w_h2[6], w_h2[7] = ld_global_v4_u32(w_ptr1)
     return x_h2, w_h2
 
 
@@ -198,9 +225,9 @@ class AddRMSNormFP4QuantKernel:
     # BF16 input and hidden_size 4096, as (cluster_n, threads_per_row,
     # num_threads). They come from per-M sweeps over vLLM's CUDA-graph capture
     # sizes for Qwen3-VL-235B NVFP4; other shapes keep the generic heuristic.
-    # cluster_n=2 takes the global-memory quantize path, which rounds h * w to
-    # BF16 before the block max, so a few block scales and FP4 codes differ
-    # from the cluster_n=1 path (both are within the quantization tolerance).
+    # cluster_n=2 takes the cluster quantize path, which rounds h * w to BF16
+    # before the block max, so a few block scales and FP4 codes differ from the
+    # cluster_n=1 path (both are within the quantization tolerance).
     _SM107_H4096_LAUNCH_CONFIGS = {
         "small": (1, 256, 256),  # 1 row per CTA
         "middle": (2, 64, 128),  # 2-CTA cluster, 2 rows per CTA
@@ -280,6 +307,19 @@ class AddRMSNormFP4QuantKernel:
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
 
         self.num_sf_blocks_per_row = H // block_size
+
+        # With a cluster, each CTA quantizes the scale-factor blocks of its own
+        # columns, reading h from its shared memory, when those blocks split
+        # evenly over a row's threads. Otherwise every CTA re-reads the full row
+        # of h from global memory after a cluster-wide fence and quantizes all
+        # of it (both CTAs write the same bytes). The arithmetic per block is
+        # the same either way, so the outputs are bitwise identical.
+        self.num_sf_blocks_per_cta = self.cols_per_tile // block_size
+        self.quantize_own_cols = (
+            self.cluster_n > 1
+            and self.cols_per_tile % block_size == 0
+            and self.num_sf_blocks_per_cta % self.threads_per_row == 0
+        )
 
         # Need swizzle params if output_swizzled or output_both_sf_layouts
         if output_swizzled or output_both_sf_layouts:
@@ -740,6 +780,9 @@ class AddRMSNormFP4QuantKernel:
         if cutlass.const_expr(cluster_n == 1):
             h_elem = h_vals.to(mX.element_type)
             tHsH.store(h_elem)
+        elif cutlass.const_expr(self.quantize_own_cols):
+            # x is no longer needed: keep this CTA's slice of h in sX for Phase 3.
+            tXsX.store(h_vals.to(mX.element_type))
 
         sum_sq = row_reduce(
             h_sq,
@@ -768,10 +811,15 @@ class AddRMSNormFP4QuantKernel:
         if row_in_bounds:
             cute.copy(copy_atom_store, tRrO, tRgO, pred=tXpX)
 
-        # In cluster mode, Phase 3 reads from mR across the FULL hidden dimension,
-        # including slices written by other CTAs.  We must ensure all CTAs' global
-        # memory writes are visible before any CTA proceeds to Phase 3.
-        if cutlass.const_expr(cluster_n > 1):
+        if cutlass.const_expr(self.quantize_own_cols):
+            # Phase 3 only reads this CTA's own h from shared memory. The
+            # cluster barrier above is relaxed, so order the sX writes here.
+            cute.arch.barrier()
+        elif cutlass.const_expr(cluster_n > 1):
+            # In cluster mode, Phase 3 reads from mR across the FULL hidden
+            # dimension, including slices written by other CTAs.  We must ensure
+            # all CTAs' global memory writes are visible before any CTA proceeds
+            # to Phase 3.
             cute.arch.fence_acq_rel_cluster()
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
@@ -780,12 +828,22 @@ class AddRMSNormFP4QuantKernel:
 
         # Phase 3: RMSNorm + Quantize
         if actual_row_idx < M:
-            num_sf_per_thread = (
-                num_sf_blocks_per_row + threads_per_row - 1
-            ) // threads_per_row
+            if cutlass.const_expr(self.quantize_own_cols):
+                # Scale-factor blocks [sf_offset, sf_offset + per_cta) of this row
+                # cover this CTA's columns [col_offset, col_offset + cols_per_tile).
+                num_sf_per_thread = self.num_sf_blocks_per_cta // threads_per_row
+                sf_offset = cluster_y * self.num_sf_blocks_per_cta
+                col_offset = cluster_y * self.cols_per_tile
+            else:
+                num_sf_per_thread = (
+                    num_sf_blocks_per_row + threads_per_row - 1
+                ) // threads_per_row
 
             for sf_iter in range(num_sf_per_thread):
-                sf_idx = lane_in_row + sf_iter * threads_per_row
+                if cutlass.const_expr(self.quantize_own_cols):
+                    sf_idx = sf_offset + lane_in_row + sf_iter * threads_per_row
+                else:
+                    sf_idx = lane_in_row + sf_iter * threads_per_row
 
                 if sf_idx < num_sf_blocks_per_row:
                     block_start = sf_idx * block_size
@@ -873,11 +931,21 @@ class AddRMSNormFP4QuantKernel:
                                 )
 
                         else:
-                            # Global memory path (cluster mode) - use helper functions
-                            # mR contains h = x + r, so load from mR
-                            h_h2, w_h2 = load_8_half2(
-                                mR, mW, actual_row_idx, block_start, H
-                            )
+                            # Cluster mode: h comes from sX (own columns) or from
+                            # mR, which holds h = x + r after the fence.
+                            if cutlass.const_expr(self.quantize_own_cols):
+                                h_h2, w_h2 = _load_8_half2_from_smem_and_gmem(
+                                    sX,
+                                    mW,
+                                    row_in_block,
+                                    block_start - col_offset,
+                                    block_start,
+                                    self.cols_per_tile,
+                                )
+                            else:
+                                h_h2, w_h2 = load_8_half2(
+                                    mR, mW, actual_row_idx, block_start, H
+                                )
 
                             if cutlass.const_expr(is_fp16):
                                 hw_h2 = half2_mul_8(h_h2, w_h2)
@@ -1067,14 +1135,37 @@ class AddRMSNormFP4QuantKernel:
                                 )
 
                         else:
-                            # Global memory path (cluster mode) - use helper functions
-                            # mR contains h = x + r, load in two chunks
-                            h_h2_c0, w_h2_c0 = load_8_half2(
-                                mR, mW, actual_row_idx, block_start, H
-                            )
-                            h_h2_c1, w_h2_c1 = load_8_half2(
-                                mR, mW, actual_row_idx, block_start + Int32(16), H
-                            )
+                            # Cluster mode: h comes from sX (own columns) or from
+                            # mR, which holds h = x + r after the fence; two
+                            # chunks of 16.
+                            if cutlass.const_expr(self.quantize_own_cols):
+                                h_h2_c0, w_h2_c0 = _load_8_half2_from_smem_and_gmem(
+                                    sX,
+                                    mW,
+                                    row_in_block,
+                                    block_start - col_offset,
+                                    block_start,
+                                    self.cols_per_tile,
+                                )
+                                h_h2_c1, w_h2_c1 = _load_8_half2_from_smem_and_gmem(
+                                    sX,
+                                    mW,
+                                    row_in_block,
+                                    block_start - col_offset + Int32(16),
+                                    block_start + Int32(16),
+                                    self.cols_per_tile,
+                                )
+                            else:
+                                h_h2_c0, w_h2_c0 = load_8_half2(
+                                    mR, mW, actual_row_idx, block_start, H
+                                )
+                                h_h2_c1, w_h2_c1 = load_8_half2(
+                                    mR,
+                                    mW,
+                                    actual_row_idx,
+                                    block_start + Int32(16),
+                                    H,
+                                )
 
                             if cutlass.const_expr(is_fp16):
                                 hw_h2_c0 = half2_mul_8(h_h2_c0, w_h2_c0)

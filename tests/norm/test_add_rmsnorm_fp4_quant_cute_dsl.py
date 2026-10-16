@@ -2787,5 +2787,155 @@ class TestSM107LaunchConfig:
         )
 
 
+@cute_dsl_available
+@blackwell_required
+class TestClusterOwnColumnQuantize:
+    """Cluster CTAs quantize their own columns from shared memory.
+
+    The arithmetic per scale-factor block is unchanged, so the outputs must be
+    bitwise identical to the path that re-reads the whole row of h from global
+    memory in every CTA of the cluster.
+    """
+
+    # (launch_config, hidden_size, uses own-column path for block 16 / block 32)
+    CONFIGS = [
+        ((2, 32, 256), 4096, True, True),  # SM107 "large"
+        ((2, 64, 128), 4096, True, True),  # SM107 "middle"
+        ((4, 32, 128), 4096, True, True),  # 4-CTA cluster
+        ((2, 32, 128), 1536, False, False),  # blocks do not split evenly
+    ]
+
+    @staticmethod
+    def _run(
+        monkeypatch,
+        own_cols,
+        launch_config,
+        hidden_size,
+        dtype,
+        block_size,
+        swizzled,
+        batch_size,
+        output_norm=False,
+    ):
+        import importlib
+
+        # The package re-exports a function with the submodule's name.
+        mod = importlib.import_module("flashinfer.cute_dsl.add_rmsnorm_fp4quant")
+        kernel_cls = mod.AddRMSNormFP4QuantKernel
+        init = kernel_cls.__init__
+
+        def legacy_init(self, *args, **kwargs):
+            init(self, *args, **kwargs)
+            self.quantize_own_cols = False
+
+        with monkeypatch.context() as m:
+            if not own_cols:
+                m.setattr(kernel_cls, "__init__", legacy_init)
+            mod._get_compiled_kernel.cache_clear()
+            fn = mod._get_compiled_kernel(
+                hidden_size,
+                block_size,
+                dtype == torch.float16,
+                get_cc(),
+                "e4m3" if block_size == 16 else "ue8m0",
+                swizzled,
+                launch_config,
+                False,  # output_both_sf_layouts
+                True,  # enable_pdl
+                output_norm,
+            )
+        mod._get_compiled_kernel.cache_clear()
+
+        torch.manual_seed(7)
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype) * 4
+        w = torch.randn(hidden_size, device="cuda", dtype=dtype) * 0.2 + 1
+        if block_size == 16:
+            global_scale = compute_global_scale(x, r, w)
+        else:
+            global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+        num_sf = hidden_size // block_size
+        if swizzled:
+            s = torch.zeros(
+                ((batch_size + 127) // 128) * ((num_sf + 3) // 4) * 512,
+                device="cuda",
+                dtype=torch.uint8,
+            )
+        else:
+            s = torch.zeros(batch_size, num_sf, device="cuda", dtype=torch.uint8)
+        y = torch.zeros(batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8)
+        s_unswizzled = torch.zeros(batch_size, num_sf, device="cuda", dtype=torch.uint8)
+        y_norm = torch.zeros(batch_size, hidden_size, device="cuda", dtype=dtype)
+        fn(
+            x,
+            r,
+            w,
+            y,
+            s,
+            s_unswizzled,
+            y_norm.view(-1) if output_norm else w,
+            global_scale,
+            batch_size,
+            1e-6,
+        )
+        torch.cuda.synchronize()
+        return y, s, r, y_norm
+
+    @pytest.mark.parametrize("config", CONFIGS)
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("block_size", [16, 32])
+    @pytest.mark.parametrize("swizzled", [False, True])
+    def test_matches_global_memory_path(
+        self, monkeypatch, config, dtype, block_size, swizzled
+    ):
+        import cutlass
+
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import AddRMSNormFP4QuantKernel
+
+        launch_config, hidden_size, own16, own32 = config
+        kernel = AddRMSNormFP4QuantKernel(
+            cutlass.Float16 if dtype == torch.float16 else cutlass.BFloat16,
+            hidden_size,
+            block_size,
+            swizzled,
+            dtype == torch.float16,
+            sm_version=get_cc(),
+            launch_config=launch_config,
+        )
+        assert kernel.quantize_own_cols == (own16 if block_size == 16 else own32)
+
+        for batch_size in (1, 300):  # one row; partial last CTA
+            new = self._run(
+                monkeypatch,
+                True,
+                launch_config,
+                hidden_size,
+                dtype,
+                block_size,
+                swizzled,
+                batch_size,
+            )
+            old = self._run(
+                monkeypatch,
+                False,
+                launch_config,
+                hidden_size,
+                dtype,
+                block_size,
+                swizzled,
+                batch_size,
+            )
+            for a, b in zip(new[:3], old[:3], strict=True):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("block_size", [16, 32])
+    def test_y_out_matches_global_memory_path(self, monkeypatch, block_size):
+        args = ((2, 32, 256), 4096, torch.bfloat16, block_size, True, 300, True)
+        new = self._run(monkeypatch, True, *args)
+        old = self._run(monkeypatch, False, *args)
+        for a, b in zip(new, old, strict=True):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
