@@ -189,9 +189,11 @@ def get_rubin_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
 
     # (mma_tiler_m, mma_inst_m) candidates — B-reuse when tiler_m = 2 * inst_m
     #
-    # The mma_tiler_m == tile_size and cluster_shape_m * mma_tiler_m <= tile_size
-    # constraints below decide which of these are reachable at a given tile_size;
-    # entries unreachable at one tile_size are reachable at another.
+    # rubin_moe_cluster_covers_one_tile decides which of these are reachable at
+    # a given tile_size: tile_size=128 keeps the 1-CTA 128x128 MMA, while
+    # tile_size=256 offers both the 1-CTA B-reuse MMA (cluster (1, 1)) and the
+    # 2-CTA 256xN MMA with cluster (2, 1), whose two CTAs share one routing
+    # tile. (512, 256) needs tile_size=512, which is not enumerated.
     mma_m_candidates = [
         (128, 128),  # no B-reuse, 1CTA
         (256, 256),  # no B-reuse, 2CTA
@@ -212,20 +214,18 @@ def get_rubin_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
         cluster_shape_mn_candidates,
         raster_along_m_candidates,
     ):
-        # GEMM1 is a gather GEMM: mma_tiler_m must equal tile_size so that
-        # each CTA's tile exactly covers one moe_sort tile in the M dimension.
-        # Smaller mma_tiler_m causes incorrect gather indexing.  (This also
-        # subsumes the mma_tiler_m > tile_size case.)
-        if mma_tiler_m != tile_size:
-            continue
-        if cluster_shape_mn[0] * mma_tiler_m > tile_size:
-            continue
-        # 2CTA (mma_inst_m=256) requires even cluster_shape_m
-        if mma_inst_m == 256 and cluster_shape_mn[0] % 2 != 0:
-            continue
-
         mma_tiler = (mma_tiler_m, mma_n, mma_tiler_k)
         mma_inst_shape = (mma_inst_m, mma_n, mma_inst_k)
+        # GEMM1 is a gather GEMM: one cluster must cover exactly one moe_sort
+        # tile in the M dimension (mma_tiler_m == tile_size, cluster_shape_m
+        # equal to the MMA CTA group size). Smaller mma_tiler_m causes
+        # incorrect gather indexing; a cluster over several routing tiles
+        # would need rounded/padded routing metadata.
+        if not rubin_moe_cluster_covers_one_tile(
+            tile_size, mma_tiler, mma_inst_shape, cluster_shape_mn
+        ):
+            continue
+
         valid_tactics.append(
             (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m)
         )
