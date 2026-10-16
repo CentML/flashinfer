@@ -57,6 +57,7 @@ from .blackwell.moe_w4a16 import launch_w4a16_moe
 from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
+    rubin_moe_cluster_covers_one_tile,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -834,7 +835,23 @@ class CuteDslFusedMoERunner(TunableRunner):
                     gemm2_tactic
                 )
 
-                if gemm1_cluster_shape_mn[0] > 1 or gemm2_cluster_shape_mn[0] > 1:
+                # A cluster must cover exactly one routing tile along M (a
+                # 2-CTA MMA with cluster_shape_m == 2 does); see
+                # rubin_moe_cluster_covers_one_tile.
+                if not (
+                    rubin_moe_cluster_covers_one_tile(
+                        tile_size,
+                        gemm1_mma_tiler,
+                        gemm1_mma_inst_shape,
+                        gemm1_cluster_shape_mn,
+                    )
+                    and rubin_moe_cluster_covers_one_tile(
+                        tile_size,
+                        gemm2_mma_tiler,
+                        gemm2_mma_inst_shape,
+                        gemm2_cluster_shape_mn,
+                    )
+                ):
                     return False
 
                 gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel.can_implement(
