@@ -1621,32 +1621,50 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     is_valid_row = permuted_row < tile_info[4]
 
                     if is_valid_row:
-                        expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
-                        token_idx = expanded_idx // self.topK
                         coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
-                        scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
+                        # flashinfer: clip the reduction to the output width.
+                        # The persistent scheduler rounds the N tile count up to
+                        # a multiple of cluster_shape_n, so with an odd N tile
+                        # count a cluster_shape_n=2 padding CTA has
+                        # coord_n == n; unclipped, it reduces a full CTA-tile row
+                        # past the end of every token row it handles (into the
+                        # next token's row, and past the allocation for the last
+                        # token). The values are zeros (TMA zero-fills B rows
+                        # >= n), so only the out-of-bounds address is visible.
+                        # Mirrors valid_columns in the Blackwell finalize kernel.
+                        valid_columns = cutlass.min(
+                            cutlass.Int64(c.shape[1]) - cutlass.Int64(coord_n),
+                            cutlass.Int64(self.cta_tile_shape_mnk[1]),
+                        )
+                        if valid_columns > 0:
+                            expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
+                            token_idx = expanded_idx // self.topK
+                            scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
+                            valid_copy_size = cutlass.Int32(
+                                valid_columns * (self.c_dtype.width // 8)
+                            )
 
-                        # sC row index: m_iter_idx * 128 + epi_tidx
-                        sC_row = m_iter_idx * 128 + epi_tidx
+                            # sC row index: m_iter_idx * 128 + epi_tidx
+                            sC_row = m_iter_idx * 128 + epi_tidx
 
-                        if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
-                            blk_reduce_bf16(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
-                            blk_reduce_fp32(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
-                            blk_reduce_fp16(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
+                            if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+                                blk_reduce_bf16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    valid_copy_size,
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
+                                blk_reduce_fp32(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    valid_copy_size,
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
+                                blk_reduce_fp16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    valid_copy_size,
+                                )
                 self.epilog_sync_barrier.arrive_and_wait()
                 # ============================================================
                 # END OF NEW CODE
