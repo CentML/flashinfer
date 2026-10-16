@@ -215,3 +215,13 @@ def test_rubin_gemm1_offers_two_cta_tile_256():
     assert sorted(t[0] for t in two_cta) == [(256, 128, 256), (256, 256, 256)]
     assert all(t[2] == (2, 1) for t in two_cta)
     assert all(t[1][0] == 128 for t in get_rubin_gemm1_valid_tactics(128))
+
+
+def test_rubin_gemm2_offers_two_cta_tile_256():
+    """tile_size=256 offers the 2-CTA finalize MMA with cluster (2, 1)."""
+    from flashinfer.fused_moe.cute_dsl.tuner import get_rubin_gemm2_valid_tactics
+
+    two_cta = [t for t in get_rubin_gemm2_valid_tactics(256) if t[1][0] == 256]
+    assert sorted(t[0] for t in two_cta) == [(256, 128, 256), (256, 256, 256)]
+    assert all(t[2] == (2, 1) for t in two_cta)
+    assert all(t[1][0] == 128 for t in get_rubin_gemm2_valid_tactics(128))

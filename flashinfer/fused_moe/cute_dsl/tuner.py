@@ -241,9 +241,9 @@ def get_rubin_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     mma_tiler_k = 256
     mma_inst_k = 128
 
-    # As in get_rubin_gemm1_valid_tactics, the mma_tiler_m == tile_size and
-    # cluster_shape_m * mma_tiler_m <= tile_size constraints below decide which
-    # of these are reachable at a given tile_size.
+    # As in get_rubin_gemm1_valid_tactics, rubin_moe_cluster_covers_one_tile
+    # decides which of these are reachable at a given tile_size: tile_size=256
+    # offers the 1-CTA B-reuse MMA and the 2-CTA 256xN MMA with cluster (2, 1).
     mma_m_candidates = [
         (128, 128),
         (256, 256),
@@ -254,7 +254,8 @@ def get_rubin_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     # cluster_shape_n is pinned to 1: the Rubin finalize kernel triggers
     # illegal memory accesses with cluster_shape_n>1 at larger token counts
     # (non-deterministic, routing-dependent).  cluster_shape_m varies here,
-    # but (2, 1) is unreachable at tile_size=128 per the note above.
+    # but (2, 1) is unreachable at tile_size=128 (it would span two routing
+    # tiles).
     cluster_shape_mn_candidates = [(1, 1), (2, 1)]
     raster_along_m_candidates = [False]
 
@@ -268,19 +269,16 @@ def get_rubin_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
         cluster_shape_mn_candidates,
         raster_along_m_candidates,
     ):
-        # tile_idx_to_expert_idx has one entry per routing tile (tile_size
-        # rows). mma_tiler_m must equal tile_size so that the CTA tile
-        # aligns with the routing tile — matching TRT-LLM's enforcement.
-        if mma_tiler_m != tile_size:
-            continue
-        if cluster_shape_mn[0] * mma_tiler_m > tile_size:
-            continue
-        # 2CTA (mma_inst_m=256) requires even cluster_shape_m
-        if mma_inst_m == 256 and cluster_shape_mn[0] % 2 != 0:
-            continue
-
         mma_tiler = (mma_tiler_m, mma_n, mma_tiler_k)
         mma_inst_shape = (mma_inst_m, mma_n, mma_inst_k)
+        # tile_idx_to_expert_idx has one entry per routing tile (tile_size
+        # rows). One cluster must cover exactly that routing tile (the
+        # mma_tiler_m == tile_size part matches TRT-LLM's enforcement).
+        if not rubin_moe_cluster_covers_one_tile(
+            tile_size, mma_tiler, mma_inst_shape, cluster_shape_mn
+        ):
+            continue
+
         valid_tactics.append(
             (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m)
         )
