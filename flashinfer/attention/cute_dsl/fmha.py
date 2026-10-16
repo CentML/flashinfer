@@ -379,8 +379,11 @@ def get_cute_dsl_fmha_kernel(
     # Check for local .so directory (development mode)
     local_dir = os.environ.get("FLASHINFER_DSL_FMHA_LOCAL_DIR")
     if local_dir:
+        # Cached per variant, so this logs once per export and shows which
+        # local export a run actually loaded.
         logger.info(
-            f"Loading DSL FMHA kernel from local dir: {local_dir} (tvm_ffi={enable_tvm_ffi})"
+            f"Loading DSL FMHA kernel variant {variant_name} from local dir: "
+            f"{local_dir} (tvm_ffi={enable_tvm_ffi})"
         )
         return _load_from_local(variant_name, local_dir, enable_tvm_ffi=enable_tvm_ffi)
 
