@@ -108,8 +108,9 @@ def test_rubin_vit_d72_d80_aot(padded_graph):
     assert torch.all(o[active:] == -17)
 
 
+@pytest.mark.parametrize("mma_rowsum", [False, True])
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_rubin_vit_d72_persistent_aot(dynamic):
+def test_rubin_vit_d72_persistent_aot(dynamic, mma_rowsum):
     if not os.environ.get("FLASHINFER_DSL_FMHA_LOCAL_DIR"):
         pytest.skip("Requires locally exported persistent ViT artifacts")
     torch.manual_seed(199)
@@ -147,6 +148,7 @@ def test_rubin_vit_d72_persistent_aot(dynamic):
                 scale_v=2.0,
                 persistent=True,
                 work_counter=counter,
+                mma_rowsum=mma_rowsum,
             )
 
     _graph_replay(run, o[:active, ..., :72])

@@ -169,6 +169,7 @@ def cute_dsl_fmha_vit(
     use_fp16_softmax: bool = True,
     persistent: bool = False,
     work_counter: torch.Tensor | None = None,
+    mma_rowsum: bool = False,
 ) -> None:
     """Noncausal FP8 ViT attention at logical D72, with D80 storage.
 
@@ -197,6 +198,9 @@ def cute_dsl_fmha_vit(
     after each launch, so sequential launches on one stream (all encoder
     layers, CUDA graph replays) may share one counter; concurrent launches
     may not. Under CUDA graphs, refresh element 1 with ``qo_indptr``.
+    ``mma_rowsum=True`` (persistent only) selects the export that accumulates
+    the softmax row sum with an auxiliary MMA; on Rubin it is a few percent
+    faster at equal or lower error.
     """
     _require_rubin(q)
     if logical_head_dim != 72:
@@ -214,6 +218,8 @@ def cute_dsl_fmha_vit(
         )
     if not isinstance(max_seqlen, int) or max_seqlen <= 0:
         raise ValueError("max_seqlen must be a positive host integer")
+    if mma_rowsum and not persistent:
+        raise ValueError("mma_rowsum requires persistent=True")
     if work_counter is not None:
         if not persistent:
             raise ValueError("work_counter requires persistent=True")
@@ -231,6 +237,7 @@ def cute_dsl_fmha_vit(
         # dynamic Work-ID queue requires.
         use_ragged_tma=persistent,
         use_dynamic_work_scheduler=work_counter is not None,
+        use_mma_rowsum=mma_rowsum,
     )
     scale_log2, scale_sm, scale_out = _scales(
         scale_q, scale_k, scale_v, scale_o, sm_scale, logical_head_dim

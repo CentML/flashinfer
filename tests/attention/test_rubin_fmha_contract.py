@@ -318,6 +318,16 @@ class RubinFmhaContractTest(unittest.TestCase):
             self.vit(persistent=True, work_counter=Tensor((2,), "e4m3"))
         self.assertFalse(self.calls)
 
+    def test_vit_mma_rowsum_selects_rowsum_export(self):
+        args, selected = self.vit(persistent=True, mma_rowsum=True)
+        self.assertTrue(selected["use_mma_rowsum"])
+        self.assertTrue(selected["is_persistent"])
+        self.assertEqual(len(args), 23)
+        _, selected = self.vit(persistent=True)
+        self.assertFalse(selected["use_mma_rowsum"])
+        with self.assertRaisesRegex(ValueError, "mma_rowsum requires persistent"):
+            self.vit(mma_rowsum=True)
+
     def test_vit_work_count_uses_256_row_tiles(self):
         count = self.ns["cute_dsl_fmha_vit_work_count"]
         self.assertEqual(count([256, 0, 257, 1], 16), 16 * (1 + 0 + 2 + 1))
@@ -485,6 +495,25 @@ class RubinFmhaContractTest(unittest.TestCase):
                 name,
                 "cute_dsl_fmha_e4m3_bf16_h72_nocausal_persistent_varlen"
                 f"{suffix}_raggedtma_fp16sm_tvmffi",
+            )
+            name = names["_get_variant_name"](
+                "e4m3",
+                "e4m3",
+                "bf16",
+                72,
+                False,
+                True,
+                varlen=True,
+                enable_tvm_ffi=True,
+                use_fp16_softmax=True,
+                use_ragged_tma=True,
+                use_dynamic_work_scheduler=dynamic,
+                use_mma_rowsum=True,
+            )
+            self.assertEqual(
+                name,
+                "cute_dsl_fmha_e4m3_bf16_h72_nocausal_persistent_varlen"
+                f"{suffix}_raggedtma_rowsum_fp16sm_tvmffi",
             )
 
 
