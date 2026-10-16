@@ -2645,5 +2645,147 @@ class TestYNormOutput:
             )
 
 
+@cute_dsl_available
+class TestSM107LaunchConfig:
+    """SM107 launch-config table for NVFP4, BF16, hidden_size 4096."""
+
+    SMALL = (1, 256, 256)
+    MIDDLE = (2, 64, 128)
+    LARGE = (2, 32, 256)
+
+    @pytest.mark.parametrize(
+        "M, expected",
+        [
+            (1, SMALL),
+            (256, SMALL),
+            (416, SMALL),
+            (417, MIDDLE),
+            (1472, MIDDLE),
+            (1473, LARGE),
+            (1536, LARGE),
+            (1537, MIDDLE),
+            (2496, LARGE),
+            (2497, MIDDLE),
+            (5120, LARGE),
+            (5121, MIDDLE),
+            (5440, MIDDLE),
+            (5441, LARGE),
+            (21504, LARGE),
+        ],
+    )
+    def test_table_selection(self, M, expected):
+        import cutlass
+
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import AddRMSNormFP4QuantKernel
+
+        config = AddRMSNormFP4QuantKernel._compute_launch_config(
+            4096, M, cutlass.BFloat16, 107, 16, "e4m3"
+        )
+        assert config == expected
+
+    @pytest.mark.parametrize(
+        "sm_version, hidden_size, is_fp16, block_size, scale_format",
+        [
+            (107, 4096, True, 16, "e4m3"),  # FP16 input
+            (107, 2048, False, 16, "e4m3"),  # other hidden size
+            (107, 4096, False, 32, "ue8m0"),  # MXFP4
+            (107, 4096, False, 16, "ue8m0"),  # block 16 with UE8M0 scales
+            (120, 4096, False, 16, "e4m3"),  # other architecture
+        ],
+    )
+    def test_uncovered_shapes_use_generic_heuristic(
+        self, sm_version, hidden_size, is_fp16, block_size, scale_format
+    ):
+        import cutlass
+
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import AddRMSNormFP4QuantKernel
+
+        kernel = AddRMSNormFP4QuantKernel
+        dtype = cutlass.Float16 if is_fp16 else cutlass.BFloat16
+        cluster_n = kernel._compute_cluster_n(hidden_size, dtype, sm_version)
+        h_per_cta = hidden_size // cluster_n
+        expected = (
+            cluster_n,
+            kernel._compute_threads_per_row(h_per_cta),
+            kernel._compute_num_threads(h_per_cta),
+        )
+        for M in (1, 1024, 21504):
+            config = kernel._compute_launch_config(
+                hidden_size, M, dtype, sm_version, block_size, scale_format
+            )
+            assert config == expected
+
+    @blackwell_required
+    @pytest.mark.parametrize("batch_size", [1, 416, 417, 1473, 5441])
+    def test_sm107_configs_match_reference(self, monkeypatch, batch_size):
+        """Run each SM107 config on the current GPU by forcing sm_version=107.
+
+        The SM version only selects the launch config, so this checks the
+        three geometries (including partial last CTAs) on any SM100+ GPU.
+        """
+        import importlib
+
+        mod = importlib.import_module("flashinfer.cute_dsl.add_rmsnorm_fp4quant")
+        monkeypatch.setattr(mod, "get_sm_version", lambda device=None: 107)
+
+        torch.manual_seed(42)
+        hidden_size = 4096
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.bfloat16
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        global_scale = compute_global_scale(x, r, weight, eps=eps)
+
+        expected_residual = x + r
+        ref_rmsnorm = llama_rms_norm(expected_residual, weight, eps=eps)
+        r_swizzled = r.clone()
+
+        y_fp4, block_scale = mod.add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=block_size,
+        )
+        torch.testing.assert_close(r, expected_residual, rtol=0, atol=0)
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size, global_scale)
+        assert_close_with_tiered_tolerance(
+            y_dequant,
+            ref_rmsnorm.float(),
+            tight_rtol=0.3,
+            tight_atol=0.5,
+            loose_rtol=0.5,
+            loose_atol=2.0,
+            tight_pct=0.99,
+        )
+
+        # The swizzled layout (used by NVFP4 GEMMs) must hold the same values.
+        y_fp4_swizzled, block_scale_swizzled = mod.add_rmsnorm_fp4quant(
+            x,
+            r_swizzled,
+            weight,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=True,
+        )
+        torch.testing.assert_close(
+            y_fp4_swizzled.view(torch.uint8), y_fp4.view(torch.uint8)
+        )
+        torch.testing.assert_close(
+            unswizzle_sf(
+                block_scale_swizzled.view(torch.uint8),
+                batch_size,
+                hidden_size,
+                block_size,
+            ),
+            block_scale.view(torch.uint8),
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

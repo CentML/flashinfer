@@ -194,6 +194,36 @@ class AddRMSNormFP4QuantKernel:
     Supports both NVFP4 (block_size=16) and MXFP4 (block_size=32) formats.
     """
 
+    # Measured SM107 launch configs for NVFP4 (block_size=16, E4M3 scales),
+    # BF16 input and hidden_size 4096, as (cluster_n, threads_per_row,
+    # num_threads). They come from per-M sweeps over vLLM's CUDA-graph capture
+    # sizes for Qwen3-VL-235B NVFP4; other shapes keep the generic heuristic.
+    # cluster_n=2 takes the global-memory quantize path, which rounds h * w to
+    # BF16 before the block max, so a few block scales and FP4 codes differ
+    # from the cluster_n=1 path (both are within the quantization tolerance).
+    _SM107_H4096_LAUNCH_CONFIGS = {
+        "small": (1, 256, 256),  # 1 row per CTA
+        "middle": (2, 64, 128),  # 2-CTA cluster, 2 rows per CTA
+        "large": (2, 32, 256),  # 2-CTA cluster, 8 rows per CTA
+    }
+    # (inclusive max M, config name), checked in order; larger M uses "large".
+    # The winner alternates between "middle" and "large" for 417 <= M <= 5440,
+    # so a single M threshold does not fit.
+    _SM107_H4096_M_RANGES = (
+        (416, "small"),
+        (1472, "middle"),
+        (1536, "large"),
+        (1600, "middle"),
+        (1664, "large"),
+        (1728, "middle"),
+        (2496, "large"),
+        (3904, "middle"),
+        (3968, "large"),
+        (4032, "middle"),
+        (5120, "large"),
+        (5440, "middle"),
+    )
+
     def __init__(
         self,
         dtype: cutlass.Numeric,
@@ -329,15 +359,46 @@ class AddRMSNormFP4QuantKernel:
         return threads_per_row, num_threads
 
     @staticmethod
+    def _compute_sm107_launch_config(
+        H: int,
+        M: int,
+        dtype: cutlass.Numeric,
+        block_size: int,
+        scale_format: str,
+    ) -> tuple[int, int, int] | None:
+        """Select the measured SM107 launch config, or None if not measured."""
+        kernel = AddRMSNormFP4QuantKernel
+        if (
+            H != 4096
+            or dtype is not cutlass.BFloat16
+            or block_size != 16
+            or scale_format != "e4m3"
+        ):
+            return None
+        for max_m, name in kernel._SM107_H4096_M_RANGES:
+            if max_m >= M:
+                return kernel._SM107_H4096_LAUNCH_CONFIGS[name]
+        return kernel._SM107_H4096_LAUNCH_CONFIGS["large"]
+
+    @staticmethod
     @functools.lru_cache(maxsize=1024)
     def _compute_launch_config(
         H: int,
         M: int,
         dtype: cutlass.Numeric,
         sm_version: int,
+        block_size: int,
+        scale_format: str,
     ) -> tuple[int, int, int]:
         """Compute a launch config while preserving the original fallback."""
         kernel = AddRMSNormFP4QuantKernel
+        if sm_version == 107:
+            sm107_config = kernel._compute_sm107_launch_config(
+                H, M, dtype, block_size, scale_format
+            )
+            if sm107_config is not None:
+                return sm107_config
+
         cluster_n = kernel._compute_cluster_n(H, dtype, sm_version)
         H_per_cta = H // cluster_n
 
@@ -1547,6 +1608,8 @@ def add_rmsnorm_fp4quant(
         batch_size,
         cutlass.Float16 if is_fp16 else cutlass.BFloat16,
         sm_version,
+        block_size,
+        actual_scale_format,
     )
     tensor_api = _get_compiled_kernel(
         hidden_size,
