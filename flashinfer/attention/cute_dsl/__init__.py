@@ -31,10 +31,12 @@ if is_cute_dsl_available():
     from .fmha_blockscaled import cute_dsl_fmha_blockscaled_prefill
     from .fmha_rubin import (
         RUBIN_GQA_TUNED_POLICY,
+        RUBIN_VIT_TUNED_POLICY,
         cute_dsl_fmha_paged_prefill,
         cute_dsl_fmha_vit,
         cute_dsl_fmha_vit_work_count,
         rubin_paged_prefill_query_layout,
+        rubin_vit_use_work_queue,
     )
 
     __all__ = [
@@ -45,6 +47,8 @@ if is_cute_dsl_available():
         "cute_dsl_fmha_blockscaled_prefill",
         "cute_dsl_fmha_vit",
         "cute_dsl_fmha_vit_work_count",
+        "RUBIN_VIT_TUNED_POLICY",
+        "rubin_vit_use_work_queue",
         "cute_dsl_fmha_paged_prefill",
         "rubin_paged_prefill_query_layout",
         "RUBIN_GQA_TUNED_POLICY",

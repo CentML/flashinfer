@@ -343,6 +343,21 @@ class RubinFmhaContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "D80 or the logical D72"):
             self.vit(64, persistent=True)
 
+    def test_vit_tuned_policy_and_work_queue_threshold(self):
+        policy = self.ns["RUBIN_VIT_TUNED_POLICY"]
+        use_queue = self.ns["rubin_vit_use_work_queue"]
+        self.assertFalse(use_queue(4096))
+        self.assertFalse(use_queue(8192))
+        self.assertTrue(use_queue(8193))
+        self.assertTrue(use_queue(65536))
+        with self.assertRaisesRegex(ValueError, "token_capacity"):
+            use_queue(0)
+        self.assertEqual(policy, {"persistent": True, "mma_rowsum": True})
+        args, selected = self.vit(72, work_counter=Tensor((2,), "int32"), **policy)
+        self.assertTrue(selected["use_mma_rowsum"])
+        self.assertTrue(selected["logical_output"])
+        self.assertTrue(selected["use_dynamic_work_scheduler"])
+
     def test_vit_work_count_uses_256_row_tiles(self):
         count = self.ns["cute_dsl_fmha_vit_work_count"]
         self.assertEqual(count([256, 0, 257, 1], 16), 16 * (1 + 0 + 2 + 1))

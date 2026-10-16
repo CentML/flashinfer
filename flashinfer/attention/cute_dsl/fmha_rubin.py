@@ -132,6 +132,28 @@ def _load_kernel(q, varlen=True, *, is_persistent=False, **kwargs):
         ) from exc
 
 
+# Persistent ViT policy measured on Rubin (212 SMs) for Qwen3-VL (16 heads,
+# logical D72) under encoder CUDA graphs: the MMA row-sum exports are 2-3%
+# faster than the REF 50a719 policy at lower error, and static Work-ID
+# strides beat the dynamic queue up to 8192 tokens of graph capacity (the
+# queue wins above, as in REF). Pass a [tokens, heads, 72] output as well to
+# avoid the D80 -> D72 crop copy.
+RUBIN_VIT_TUNED_POLICY = {"persistent": True, "mma_rowsum": True}
+_RUBIN_VIT_STATIC_WORK_MAX_TOKENS = 8192
+
+
+def rubin_vit_use_work_queue(token_capacity: int) -> bool:
+    """Whether a persistent ``cute_dsl_fmha_vit`` launch should pass a counter.
+
+    ``token_capacity`` is the token extent of the Q/K/V buffers (the encoder
+    CUDA graph capacity). It is fixed per captured graph, unlike the
+    replayed sequence lengths, so the choice is stable under graph replay.
+    """
+    if not isinstance(token_capacity, int) or token_capacity <= 0:
+        raise ValueError("token_capacity must be a positive host integer")
+    return token_capacity > _RUBIN_VIT_STATIC_WORK_MAX_TOKENS
+
+
 def cute_dsl_fmha_vit_work_count(sequence_lengths, num_heads: int) -> int:
     """Return the Work-ID count of a persistent ``cute_dsl_fmha_vit`` launch.
 
