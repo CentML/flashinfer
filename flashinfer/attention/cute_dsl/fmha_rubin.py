@@ -18,9 +18,10 @@ missing artifact is an error, not permission to silently compile a different
 kernel. Warm up before CUDA graph capture (or preinstall the cubin wheel).
 
 The pinned MR199 collection supplies D72/D80 ViT and BF16 NHD paged GQA.
-HND, fused NVFP4 output, and the multi-sequence ragged page-table fix require
-new exports. Until those are published, use FLASHINFER_DSL_FMHA_LOCAL_DIR with
-the matching cubin_publishing build; this module does not invent a future pin.
+HND, fused NVFP4 output, the multi-sequence ragged page-table fix and the
+persistent ViT variants require new exports. Until those are published, use
+FLASHINFER_DSL_FMHA_LOCAL_DIR with the matching cubin_publishing build; this
+module does not invent a future pin.
 """
 
 import math
@@ -110,13 +111,13 @@ def rubin_paged_prefill_query_layout(
     return "packed", "direct"
 
 
-def _load_kernel(q, varlen=True, **kwargs):
+def _load_kernel(q, varlen=True, *, is_persistent=False, **kwargs):
     try:
         return get_cute_dsl_fmha_kernel(
             _get_gpu_arch(q.device),
             q.dtype,
             q.dtype,
-            is_persistent=False,
+            is_persistent=is_persistent,
             enable_tvm_ffi=True,
             varlen=varlen,
             **kwargs,
@@ -129,6 +130,26 @@ def _load_kernel(q, varlen=True, **kwargs):
             "GQA exports are not included in the MR199 artifact pin. "
             "There is no JIT fallback for this entry point."
         ) from exc
+
+
+def cute_dsl_fmha_vit_work_count(sequence_lengths, num_heads: int) -> int:
+    """Return the Work-ID count of a persistent ``cute_dsl_fmha_vit`` launch.
+
+    ``sequence_lengths`` are the host token counts described by
+    ``qo_indptr`` (CUDA graph padding entries are 0), and ``num_heads`` is
+    the launch's head count. Store the result in ``work_counter[1]``.
+    """
+    # One Work ID covers 2 x 128 query rows of one (sequence, head).
+    q_tile_rows = 256
+    if not isinstance(num_heads, int) or num_heads <= 0:
+        raise ValueError("num_heads must be a positive integer")
+    q_tiles = 0
+    for length in sequence_lengths:
+        length = int(length)
+        if length < 0:
+            raise ValueError("sequence lengths must be non-negative")
+        q_tiles += (length + q_tile_rows - 1) // q_tile_rows
+    return num_heads * q_tiles
 
 
 def cute_dsl_fmha_vit(
@@ -146,6 +167,8 @@ def cute_dsl_fmha_vit(
     scale_v: float = 1.0,
     scale_o: float = 1.0,
     use_fp16_softmax: bool = True,
+    persistent: bool = False,
+    work_counter: torch.Tensor | None = None,
 ) -> None:
     """Noncausal FP8 ViT attention at logical D72, with D80 storage.
 
@@ -161,6 +184,19 @@ def cute_dsl_fmha_vit(
     are defined. Value checks are the caller's responsibility; this API
     performs no device-to-host reads.
     Scalars are host-side dequantization scales. Output is modified in place.
+
+    The default export launches one CTA per ``max_seqlen`` tile, sequence slot
+    and head; most of them exit at once when ``max_seqlen`` is a CUDA graph
+    capacity. ``persistent=True`` selects the persistent export instead: a
+    grid of at most one CTA per SM (fixed when the artifact is exported)
+    walks only the valid 256-row Q tiles and stores O through ragged TMA.
+    With ``work_counter``, those CTAs take Work IDs from a global queue
+    rather than a static stride. It is a CUDA int32 tensor
+    ``[0, cute_dsl_fmha_vit_work_count(lengths, heads)]`` for the lengths
+    in ``qo_indptr``; element 1 must be exact. The kernel resets element 0
+    after each launch, so sequential launches on one stream (all encoder
+    layers, CUDA graph replays) may share one counter; concurrent launches
+    may not. Under CUDA graphs, refresh element 1 with ``qo_indptr``.
     """
     _require_rubin(q)
     if logical_head_dim != 72:
@@ -178,12 +214,23 @@ def cute_dsl_fmha_vit(
         )
     if not isinstance(max_seqlen, int) or max_seqlen <= 0:
         raise ValueError("max_seqlen must be a positive host integer")
+    if work_counter is not None:
+        if not persistent:
+            raise ValueError("work_counter requires persistent=True")
+        _require_tensor(work_counter, "work_counter", q.device, torch.int32, 1, align=4)
+        if work_counter.numel() != 2:
+            raise ValueError("work_counter must hold [next_work_idx, total_work]")
     kernel = _load_kernel(
         q,
+        is_persistent=persistent,
         out_dtype=o.dtype,
         head_dim=logical_head_dim,
         is_causal=False,
         use_fp16_softmax=use_fp16_softmax,
+        # Persistent ViT exports use the ragged-TMA output store, which the
+        # dynamic Work-ID queue requires.
+        use_ragged_tma=persistent,
+        use_dynamic_work_scheduler=work_counter is not None,
     )
     scale_log2, scale_sm, scale_out = _scales(
         scale_q, scale_k, scale_v, scale_o, sm_scale, logical_head_dim
@@ -222,7 +269,7 @@ def cute_dsl_fmha_vit(
         None,
         None,
         None,
-        None,
+        work_counter,
     )
 
 

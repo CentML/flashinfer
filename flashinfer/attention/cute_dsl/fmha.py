@@ -139,6 +139,7 @@ def _get_variant_name(
     rescale_threshold: Optional[float] = None,
     use_mma_rowsum: bool = False,
     use_packed_nvfp4_epilogue: bool = False,
+    use_dynamic_work_scheduler: bool = False,
 ) -> str:
     """Generate the variant name matching compile_cute_dsl_fmha.py naming convention.
 
@@ -168,6 +169,7 @@ def _get_variant_name(
     paged_str = f"_paged{page_size}" if page_size is not None else ""
     layout_str = "_hnd" if page_size is not None and kv_layout == "HND" else ""
     heads_str = f"_qh{num_q_heads}" if num_q_heads is not None else ""
+    dynwork_str = "_dynwork" if use_dynamic_work_scheduler else ""
     if use_ragged_tma and use_dense_tma:
         raise ValueError("use_ragged_tma and use_dense_tma are exclusive")
     store_str = "_raggedtma" if use_ragged_tma else "_densetma" if use_dense_tma else ""
@@ -187,7 +189,7 @@ def _get_variant_name(
     return (
         f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}"
         f"{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}"
-        f"{paged_str}{layout_str}{heads_str}{store_str}"
+        f"{paged_str}{layout_str}{heads_str}{dynwork_str}{store_str}"
         f"{sched_str}{sb_str}{rt_str}{rowsum_str}{sfpack_str}{fp16sm_str}{ffi_str}"
     )
 
@@ -297,6 +299,7 @@ def get_cute_dsl_fmha_kernel(
     rescale_threshold: Optional[float] = None,
     use_mma_rowsum: bool = False,
     use_packed_nvfp4_epilogue: bool = False,
+    use_dynamic_work_scheduler: bool = False,
 ):
     """Get a compiled DSL FMHA kernel function.
 
@@ -344,6 +347,10 @@ def get_cute_dsl_fmha_kernel(
     use_packed_nvfp4_epilogue : bool
         Load the NVFP4 export whose epilogue folds 1/row_sum into the block
         scale and stores four Layout128x4 scales per 32-bit store (``_sfpack``).
+    use_dynamic_work_scheduler : bool
+        If True, load the persistent variant that takes Work IDs from a
+        global queue (``_dynwork``). Its last call argument is the CUDA
+        ``int32[2]`` counter ``[next_work_idx, total_work]``.
 
     Returns
     -------
@@ -374,6 +381,7 @@ def get_cute_dsl_fmha_kernel(
         rescale_threshold=rescale_threshold,
         use_mma_rowsum=use_mma_rowsum,
         use_packed_nvfp4_epilogue=use_packed_nvfp4_epilogue,
+        use_dynamic_work_scheduler=use_dynamic_work_scheduler,
     )
 
     # Check for local .so directory (development mode)

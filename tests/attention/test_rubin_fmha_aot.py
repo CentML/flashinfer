@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical AOT-only Rubin integration tests.
 
-ViT uses the published artifact pin. Paged tests require locally rebuilt HND
-exports (FLASHINFER_DSL_FMHA_LOCAL_DIR) until those are published. Missing
-artifacts fail, never JIT. Tolerances are FP8/FP4 smoke gates, not MLPerf accuracy.
+ViT uses the published artifact pin. Paged and persistent ViT tests require
+locally rebuilt exports (FLASHINFER_DSL_FMHA_LOCAL_DIR) until those are
+published. Missing artifacts fail, never JIT. Tolerances are FP8/FP4 smoke
+gates, not MLPerf accuracy.
 """
 
 import math
@@ -17,6 +18,7 @@ from flashinfer.attention.cute_dsl import (
     RUBIN_GQA_TUNED_POLICY,
     cute_dsl_fmha_paged_prefill,
     cute_dsl_fmha_vit,
+    cute_dsl_fmha_vit_work_count,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -96,6 +98,65 @@ def test_rubin_vit_d72_d80_aot(padded_graph):
         q[..., :72],
         k[..., :72],
         v[..., :72],
+        lengths,
+        lengths,
+        0.125 / math.sqrt(72),
+        2.0,
+        False,
+    )
+    torch.testing.assert_close(o[:active, ..., :72].float(), ref, rtol=0.05, atol=0.05)
+    assert torch.all(o[active:] == -17)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_rubin_vit_d72_persistent_aot(dynamic):
+    if not os.environ.get("FLASHINFER_DSL_FMHA_LOCAL_DIR"):
+        pytest.skip("Requires locally exported persistent ViT artifacts")
+    torch.manual_seed(199)
+    # Partial 256-row tiles, empty graph-padding slots and an unused tail.
+    lengths = [300, 0, 1024, 17, 0, 0]
+    active = sum(lengths)
+    capacity = active + 64
+    tensors = []
+    for _ in range(3):
+        padded = torch.zeros((capacity, 16, 80), device="cuda")
+        padded[:active, :, :72] = torch.randn((active, 16, 72), device="cuda") * 0.5
+        tensors.append(padded.to(torch.float8_e4m3fn))
+    q, k, v = tensors
+    o = torch.zeros(q.shape, dtype=torch.bfloat16, device="cuda")
+    o[active:].fill_(-17)
+    indptr = _indptr(lengths)
+    counter = None
+    if dynamic:
+        work = cute_dsl_fmha_vit_work_count(lengths, 16)
+        counter = torch.tensor([0, work], dtype=torch.int32, device="cuda")
+
+    def run():
+        # Encoder layers launch back to back with one shared counter, and
+        # max_seqlen is the graph capacity rather than the longest sequence.
+        for _ in range(2):
+            cute_dsl_fmha_vit(
+                q,
+                k,
+                v,
+                o,
+                indptr,
+                capacity,
+                scale_q=0.5,
+                scale_k=0.25,
+                scale_v=2.0,
+                persistent=True,
+                work_counter=counter,
+            )
+
+    _graph_replay(run, o[:active, ..., :72])
+    if dynamic:
+        # The last Work-ID claimant resets the queue for the next launch.
+        assert counter.tolist() == [0, work]
+    ref = _reference(
+        q[:active, ..., :72],
+        k[:active, ..., :72],
+        v[:active, ..., :72],
         lengths,
         lengths,
         0.125 / math.sqrt(72),

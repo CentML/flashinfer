@@ -264,6 +264,12 @@ class RubinFmhaContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             pick([])
 
+    def vit(self, **kwargs):
+        q, k, v = [Tensor((193, 16, 80)) for _ in range(3)]
+        o, indptr = Tensor(q.shape, "bf16"), Tensor((3,), "int32")
+        self.ns["cute_dsl_fmha_vit"](q, k, v, o, indptr, 129, **kwargs)
+        return self.calls[-1], self.selection[-1][1]
+
     def test_vit_uses_logical_dimension_and_token_indptr(self):
         q, k, v = [Tensor((193, 16, 80)) for _ in range(3)]
         o, indptr = Tensor(q.shape, "bf16"), Tensor((3,), "int32")
@@ -276,6 +282,49 @@ class RubinFmhaContractTest(unittest.TestCase):
         self.assertIs(args[6], indptr)
         self.assertAlmostEqual(args[10], 1 / math.sqrt(72))
         self.assertFalse(args[17])
+
+    def test_vit_defaults_to_nonpersistent_export(self):
+        args, selected = self.vit()
+        self.assertFalse(selected["is_persistent"])
+        self.assertFalse(selected["use_ragged_tma"])
+        self.assertFalse(selected["use_dynamic_work_scheduler"])
+        self.assertIsNone(args[22])
+
+    def test_vit_persistent_static_work_ids(self):
+        args, selected = self.vit(persistent=True)
+        self.assertEqual(len(args), 23)
+        self.assertTrue(selected["is_persistent"])
+        self.assertTrue(selected["use_ragged_tma"])
+        self.assertFalse(selected["use_dynamic_work_scheduler"])
+        self.assertIsNone(args[22])
+
+    def test_vit_dynamic_work_counter_is_last_argument(self):
+        counter = Tensor((2,), "int32")
+        args, selected = self.vit(persistent=True, work_counter=counter)
+        self.assertEqual(len(args), 23)
+        self.assertTrue(selected["is_persistent"])
+        self.assertTrue(selected["use_dynamic_work_scheduler"])
+        self.assertIs(args[22], counter)
+        # The scheduler choice does not change the metadata slots.
+        self.assertEqual(args[4], (2, 129, 193, 129, 16, 16, 72, 72))
+        self.assertIsNone(args[18])
+
+    def test_vit_work_counter_contract(self):
+        with self.assertRaisesRegex(ValueError, "requires persistent"):
+            self.vit(work_counter=Tensor((2,), "int32"))
+        with self.assertRaisesRegex(ValueError, "next_work_idx"):
+            self.vit(persistent=True, work_counter=Tensor((3,), "int32"))
+        with self.assertRaisesRegex(ValueError, "work_counter must be"):
+            self.vit(persistent=True, work_counter=Tensor((2,), "e4m3"))
+        self.assertFalse(self.calls)
+
+    def test_vit_work_count_uses_256_row_tiles(self):
+        count = self.ns["cute_dsl_fmha_vit_work_count"]
+        self.assertEqual(count([256, 0, 257, 1], 16), 16 * (1 + 0 + 2 + 1))
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            count([-1], 16)
+        with self.assertRaisesRegex(ValueError, "num_heads"):
+            count([1], 0)
 
     def test_scale_columns_must_be_exact(self):
         with self.assertRaisesRegex(ValueError, "wrong shape"):
@@ -418,6 +467,25 @@ class RubinFmhaContractTest(unittest.TestCase):
             prefix
             + "_varlen_pdl_paged16_hnd_qh64_raggedtma_clc_nosb_rowsum_sfpack_fp16sm_tvmffi",
         )
+        for dynamic, suffix in ((False, ""), (True, "_dynwork")):
+            name = names["_get_variant_name"](
+                "e4m3",
+                "e4m3",
+                "bf16",
+                72,
+                False,
+                True,
+                varlen=True,
+                enable_tvm_ffi=True,
+                use_fp16_softmax=True,
+                use_ragged_tma=True,
+                use_dynamic_work_scheduler=dynamic,
+            )
+            self.assertEqual(
+                name,
+                "cute_dsl_fmha_e4m3_bf16_h72_nocausal_persistent_varlen"
+                f"{suffix}_raggedtma_fp16sm_tvmffi",
+            )
 
 
 if __name__ == "__main__":

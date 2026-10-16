@@ -33,6 +33,7 @@ if is_cute_dsl_available():
         RUBIN_GQA_TUNED_POLICY,
         cute_dsl_fmha_paged_prefill,
         cute_dsl_fmha_vit,
+        cute_dsl_fmha_vit_work_count,
         rubin_paged_prefill_query_layout,
     )
 
@@ -43,6 +44,7 @@ if is_cute_dsl_available():
         "cute_dsl_fmha_ragged_prefill",
         "cute_dsl_fmha_blockscaled_prefill",
         "cute_dsl_fmha_vit",
+        "cute_dsl_fmha_vit_work_count",
         "cute_dsl_fmha_paged_prefill",
         "rubin_paged_prefill_query_layout",
         "RUBIN_GQA_TUNED_POLICY",
