@@ -251,12 +251,13 @@ def get_rubin_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
         (512, 256),
     ]
     mma_n_candidates = [128, 256]
-    # cluster_shape_n is pinned to 1: the Rubin finalize kernel triggers
-    # illegal memory accesses with cluster_shape_n>1 at larger token counts
-    # (non-deterministic, routing-dependent).  cluster_shape_m varies here,
-    # but (2, 1) is unreachable at tile_size=128 (it would span two routing
-    # tiles).
-    cluster_shape_mn_candidates = [(1, 1), (2, 1)]
+    # cluster_shape_n=2 multicasts the A/SFA tile to the two CTAs of a
+    # cluster, which compute adjacent N tiles of the same routing tile (1-CTA
+    # MMA only: a 2-CTA MMA needs cluster_shape_m == 2). With an odd N tile
+    # count the scheduler adds a padding CTA, whose finalize reduction is
+    # clipped to the output width. (2, 1) is unreachable at tile_size=128 (it
+    # would span two routing tiles).
+    cluster_shape_mn_candidates = [(1, 1), (2, 1), (1, 2)]
     raster_along_m_candidates = [False]
 
     valid_tactics = []

@@ -225,3 +225,20 @@ def test_rubin_gemm2_offers_two_cta_tile_256():
     assert sorted(t[0] for t in two_cta) == [(256, 128, 256), (256, 256, 256)]
     assert all(t[2] == (2, 1) for t in two_cta)
     assert all(t[1][0] == 128 for t in get_rubin_gemm2_valid_tactics(128))
+
+
+@pytest.mark.parametrize("tile_size", [128, 256])
+def test_rubin_gemm2_offers_cluster_n_2(tile_size):
+    """Every 1-CTA finalize MMA is offered with cluster (1, 1) and (1, 2)."""
+    from flashinfer.fused_moe.cute_dsl.tuner import get_rubin_gemm2_valid_tactics
+
+    tactics = get_rubin_gemm2_valid_tactics(tile_size)
+    one_cta = {(t[0], t[1]) for t in tactics if t[1][0] == 128}
+    assert one_cta, f"no 1-CTA finalize tactic at tile_size={tile_size}"
+    for mma_tiler, mma_inst_shape in one_cta:
+        clusters = {
+            t[2] for t in tactics if (t[0], t[1]) == (mma_tiler, mma_inst_shape)
+        }
+        assert clusters == {(1, 1), (1, 2)}, (mma_tiler, mma_inst_shape, clusters)
+    # A 2-CTA finalize keeps cluster (2, 1) only.
+    assert all(t[2] == (2, 1) for t in tactics if t[1][0] == 256)
