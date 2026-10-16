@@ -154,6 +154,89 @@ class RubinFmhaContractTest(unittest.TestCase):
         self.assertTrue(self.selection[0][1]["use_ragged_tma"])
         self.assertEqual(args[1].stride(), (16384, 4096, 256, 1))
 
+    def test_default_paged_selection_is_unchanged(self):
+        self.paged()
+        selection = self.selection[0][1]
+        self.assertTrue(selection["varlen"])
+        self.assertIsNone(selection["scheduler"])
+        self.assertFalse(selection["use_dense_tma"])
+        self.assertFalse(selection["disable_sequence_barrier"])
+        self.assertIsNone(selection["rescale_threshold"])
+        self.assertFalse(selection["use_mma_rowsum"])
+        self.assertFalse(selection["use_packed_nvfp4_epilogue"])
+
+    def test_uniform_query_layout_abi(self):
+        policy = dict(
+            scheduler="auto",
+            sequence_barrier=False,
+            mma_rowsum=True,
+            packed_nvfp4_epilogue=True,
+        )
+        self.paged(
+            q=Tensor((192, 64, 128)),
+            o=Tensor((192, 64, 64), "uint8"),
+            max_q_len=96,
+            query_layout="uniform",
+            **policy,
+        )
+        args = self.calls[0]
+        self.assertEqual(len(args), 23)
+        self.assertEqual(args[0].shape, (2, 96, 4, 16, 128))
+        self.assertEqual(args[3].shape, (2, 96, 4, 16, 64))
+        self.assertEqual(args[4], (2, 96, 96, 177, 64, 4, 128, 128))
+        self.assertIsNone(args[5])
+        self.assertEqual(args[6].shape, (3,))
+        selection = self.selection[0][1]
+        self.assertFalse(selection["varlen"])
+        self.assertEqual(selection["scheduler"], "clc")
+        self.assertFalse(selection["use_ragged_tma"])
+        self.assertFalse(selection["use_dense_tma"])
+        self.assertTrue(selection["disable_sequence_barrier"])
+        self.assertIsNone(selection["rescale_threshold"])
+        self.assertTrue(selection["use_mma_rowsum"])
+        self.assertTrue(selection["use_packed_nvfp4_epilogue"])
+
+    def test_uniform_query_layout_requires_equal_lengths(self):
+        with self.assertRaisesRegex(ValueError, "equal query lengths"):
+            self.paged(query_layout="uniform")
+        self.assertFalse(self.calls)
+
+    def test_policy_scheduler_follows_output_store(self):
+        policy = dict(scheduler="auto", sequence_barrier=False, rescale_threshold=0.0)
+        for store, scheduler, dense, ragged in (
+            ("ragged_tma", "clc", False, True),
+            ("tma", "clc", True, False),
+            ("direct", "cluster", False, False),
+        ):
+            self.selection.clear()
+            self.paged(output_store=store, **policy)
+            selection = self.selection[0][1]
+            self.assertTrue(selection["varlen"])
+            self.assertEqual(selection["scheduler"], scheduler)
+            self.assertEqual(selection["use_dense_tma"], dense)
+            self.assertEqual(selection["use_ragged_tma"], ragged)
+        with self.assertRaisesRegex(ValueError, "CLC"):
+            self.paged(output_store="direct", scheduler="clc")
+
+    def test_bf16_dense_tma_allowed_ragged_rejected(self):
+        bf16 = dict(
+            o=Tensor((193, 64, 128), "bf16"),
+            output_block_scale=None,
+            o_sf_scale=None,
+            o_sf_start_index=0,
+        )
+        self.paged(
+            output_store="tma", scheduler="auto", packed_nvfp4_epilogue=True, **bf16
+        )
+        selection = self.selection[0][1]
+        self.assertTrue(selection["use_dense_tma"])
+        self.assertIsNone(selection["num_q_heads"])
+        self.assertEqual(selection["scheduler"], "clc")
+        # The packed NVFP4 epilogue does not apply to BF16 output.
+        self.assertFalse(selection["use_packed_nvfp4_epilogue"])
+        with self.assertRaisesRegex(ValueError, "ragged_tma for NVFP4"):
+            self.paged(output_store="ragged_tma", **bf16)
+
     def test_vit_uses_logical_dimension_and_token_indptr(self):
         q, k, v = [Tensor((193, 16, 80)) for _ in range(3)]
         o, indptr = Tensor(q.shape, "bf16"), Tensor((3,), "int32")

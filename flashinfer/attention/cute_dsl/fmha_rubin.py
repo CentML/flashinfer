@@ -67,7 +67,7 @@ def _scales(scale_q, scale_k, scale_v, scale_o, sm_scale, head_dim):
     return Float32(qk * math.log2(math.e)), Float32(qk), Float32(output)
 
 
-def _load_kernel(q, **kwargs):
+def _load_kernel(q, varlen=True, **kwargs):
     try:
         return get_cute_dsl_fmha_kernel(
             _get_gpu_arch(q.device),
@@ -75,7 +75,7 @@ def _load_kernel(q, **kwargs):
             q.dtype,
             is_persistent=False,
             enable_tvm_ffi=True,
-            varlen=True,
+            varlen=varlen,
             **kwargs,
         )
     except (RuntimeError, FileNotFoundError) as exc:
@@ -206,6 +206,12 @@ def cute_dsl_fmha_paged_prefill(
     o_sf_start_index: int = 0,
     use_fp16_softmax: bool = True,
     output_store: str | None = None,
+    query_layout: str = "packed",
+    scheduler: str | None = None,
+    sequence_barrier: bool = True,
+    rescale_threshold: float | None = None,
+    mma_rowsum: bool = False,
+    packed_nvfp4_epilogue: bool = False,
 ) -> None:
     """Causal Rubin paged FP8 GQA, optionally with fused NVFP4 output.
 
@@ -230,6 +236,26 @@ def cute_dsl_fmha_paged_prefill(
     remains 1 for NVFP4; it is not the FP4 global scale.
     ``output_store=None`` selects ragged TMA for NVFP4 and direct stores for
     BF16. NVFP4 also accepts ``output_store="direct"`` for comparison.
+    ``output_store="tma"`` stores packed O through a dense TMA descriptor; the
+    caller guarantees that every request except the last has a query length
+    that is a multiple of 256 (one CTA's Q tile), otherwise a tile spanning two
+    requests overwrites the next request's rows.
+
+    ``query_layout="uniform"`` views Q/O as ``[batch, max_q_len, ...]``
+    without ``qo_indptr`` (every request has ``max_q_len`` query tokens;
+    checked as ``batch * max_q_len == total_q``) and always stores O through
+    TMA.
+
+    ``scheduler``, ``sequence_barrier``, ``rescale_threshold``,
+    ``mma_rowsum`` and ``packed_nvfp4_epilogue`` select exports built with
+    those kernel options (names ``_cluster``/``_clc``, ``_nosb``,
+    ``_rt<threshold>``, ``_rowsum``, ``_sfpack``). ``scheduler=None`` is the
+    legacy launch of the original exports; ``"cluster"`` the static scheduler
+    with cluster launch; ``"clc"`` Rubin hardware CLC Work IDs (page size 16
+    with a TMA output store); ``"auto"`` is ``"clc"`` where allowed and
+    ``"cluster"`` otherwise. ``packed_nvfp4_epilogue`` applies to NVFP4 output
+    only and is ignored for BF16. The defaults load the same exports as
+    before.
 
     Warm up this explicit AOT-only path before CUDA graph capture. Missing
     specializations raise instead of falling back to BF16 or public JIT.
@@ -298,12 +324,37 @@ def cute_dsl_fmha_paged_prefill(
         raise ValueError("page_table has insufficient columns for max_kv_len")
 
     fp4 = o.dtype == torch.uint8
+    if query_layout not in ("packed", "uniform"):
+        raise ValueError("query_layout must be 'packed' or 'uniform'")
+    uniform = query_layout == "uniform"
     if output_store is None:
-        output_store = "ragged_tma" if fp4 else "direct"
-    if output_store not in ("direct", "ragged_tma") or (
-        not fp4 and output_store != "direct"
+        output_store = "tma" if uniform else "ragged_tma" if fp4 else "direct"
+    if output_store not in ("direct", "ragged_tma", "tma") or (
+        not fp4 and output_store == "ragged_tma"
     ):
-        raise ValueError("output_store supports direct, or ragged_tma for NVFP4 only")
+        raise ValueError(
+            "output_store supports direct or tma, or ragged_tma for NVFP4 only"
+        )
+    if uniform:
+        if output_store != "tma":
+            raise ValueError("The uniform query layout stores O through TMA only")
+        # Every length is <= max_q_len, so the sum equals batch * max_q_len
+        # exactly when all requests have max_q_len query tokens.
+        if batch * max_q_len != total:
+            raise ValueError(
+                "The uniform query layout requires equal query lengths "
+                "(batch * max_q_len == total_q)"
+            )
+    if scheduler == "auto":
+        scheduler = "clc" if output_store != "direct" and page_size == 16 else "cluster"
+    if scheduler not in (None, "cluster", "clc"):
+        raise ValueError("scheduler must be None, 'auto', 'cluster' or 'clc'")
+    if scheduler == "clc" and (output_store == "direct" or page_size != 16):
+        raise ValueError("CLC scheduling requires page size 16 and a TMA output store")
+    if rescale_threshold is not None:
+        rescale_threshold = float(rescale_threshold)
+        if not math.isfinite(rescale_threshold) or rescale_threshold < 0:
+            raise ValueError("rescale_threshold must be finite and non-negative")
     _require_tensor(
         o, "o", q.device, torch.uint8 if fp4 else torch.bfloat16, 3, align=32
     )
@@ -349,6 +400,7 @@ def cute_dsl_fmha_paged_prefill(
 
     kernel = _load_kernel(
         q,
+        varlen=not uniform,
         out_dtype=o.dtype,
         head_dim=d,
         is_causal=True,
@@ -358,6 +410,12 @@ def cute_dsl_fmha_paged_prefill(
         num_q_heads=hq if fp4 else None,
         use_fp16_softmax=use_fp16_softmax,
         use_ragged_tma=output_store == "ragged_tma",
+        use_dense_tma=output_store == "tma" and not uniform,
+        scheduler=scheduler,
+        disable_sequence_barrier=not sequence_barrier,
+        rescale_threshold=rescale_threshold,
+        use_mma_rowsum=mma_rowsum,
+        use_packed_nvfp4_epilogue=packed_nvfp4_epilogue and fp4,
     )
     scale_log2, scale_sm, scale_out = _scales(
         scale_q, scale_k, scale_v, scale_o, sm_scale, d
@@ -367,14 +425,19 @@ def cute_dsl_fmha_paged_prefill(
     else:
         k_arg = k_cache.view(pages, page_size, hk, 1, d)
         v_arg = v_cache.view(pages, page_size, hk, 1, d)
-    problem = (batch, max_q_len, total, max_kv_len, hq, hk, d, d)
+    if uniform:
+        # Fixed-length Q: [batch, max_q_len] rows, no Q cumulative counts.
+        q_batch, q_extent, q_indptr = batch, max_q_len, None
+    else:
+        q_batch, q_extent, q_indptr = 1, total, qo_indptr
+    problem = (batch, max_q_len, q_extent, max_kv_len, hq, hk, d, d)
     kernel(
-        q.view(1, total, hk, hq // hk, d),
+        q.view(q_batch, q_extent, hk, hq // hk, d),
         k_arg,
         v_arg,
-        o_arg.view(1, total, hk, hq // hk, o.shape[-1]),
+        o_arg.view(q_batch, q_extent, hk, hq // hk, o.shape[-1]),
         problem,
-        qo_indptr,
+        q_indptr,
         kv_indptr,
         None,
         None,
