@@ -264,9 +264,9 @@ class RubinFmhaContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             pick([])
 
-    def vit(self, out_width=80, **kwargs):
+    def vit(self, **kwargs):
         q, k, v = [Tensor((193, 16, 80)) for _ in range(3)]
-        o, indptr = Tensor((193, 16, out_width), "bf16"), Tensor((3,), "int32")
+        o, indptr = Tensor(q.shape, "bf16"), Tensor((3,), "int32")
         self.ns["cute_dsl_fmha_vit"](q, k, v, o, indptr, 129, **kwargs)
         return self.calls[-1], self.selection[-1][1]
 
@@ -328,21 +328,6 @@ class RubinFmhaContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mma_rowsum requires persistent"):
             self.vit(mma_rowsum=True)
 
-    def test_vit_logical_width_output(self):
-        counter = Tensor((2,), "int32")
-        args, selected = self.vit(72, persistent=True, work_counter=counter)
-        self.assertTrue(selected["logical_output"])
-        self.assertEqual(args[3].shape, (1, 193, 16, 1, 72))
-        self.assertEqual(args[0].shape, (1, 193, 16, 1, 80))
-        self.assertEqual(args[4][-2:], (72, 72))
-        self.assertIs(args[22], counter)
-        _, selected = self.vit(persistent=True)
-        self.assertFalse(selected["logical_output"])
-        with self.assertRaisesRegex(ValueError, "requires persistent"):
-            self.vit(72)
-        with self.assertRaisesRegex(ValueError, "D80 or the logical D72"):
-            self.vit(64, persistent=True)
-
     def test_vit_tuned_policy_and_work_queue_threshold(self):
         policy = self.ns["RUBIN_VIT_TUNED_POLICY"]
         use_queue = self.ns["rubin_vit_use_work_queue"]
@@ -353,10 +338,16 @@ class RubinFmhaContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "token_capacity"):
             use_queue(0)
         self.assertEqual(policy, {"persistent": True, "mma_rowsum": True})
-        args, selected = self.vit(72, work_counter=Tensor((2,), "int32"), **policy)
+        args, selected = self.vit(work_counter=Tensor((2,), "int32"), **policy)
         self.assertTrue(selected["use_mma_rowsum"])
-        self.assertTrue(selected["logical_output"])
         self.assertTrue(selected["use_dynamic_work_scheduler"])
+        # The tuned exports write O at the D80 storage width; a compact D72
+        # output is rejected.
+        self.assertEqual(args[3].shape, (1, 193, 16, 1, 80))
+        q, k, v = [Tensor((193, 16, 80)) for _ in range(3)]
+        o72, indptr = Tensor((193, 16, 72), "bf16"), Tensor((3,), "int32")
+        with self.assertRaisesRegex(ValueError, "identical padded shapes"):
+            self.ns["cute_dsl_fmha_vit"](q, k, v, o72, indptr, 129, **policy)
 
     def test_vit_work_count_uses_256_row_tiles(self):
         count = self.ns["cute_dsl_fmha_vit_work_count"]
@@ -544,26 +535,6 @@ class RubinFmhaContractTest(unittest.TestCase):
                 name,
                 "cute_dsl_fmha_e4m3_bf16_h72_nocausal_persistent_varlen"
                 f"{suffix}_raggedtma_rowsum_fp16sm_tvmffi",
-            )
-            name = names["_get_variant_name"](
-                "e4m3",
-                "e4m3",
-                "bf16",
-                72,
-                False,
-                True,
-                varlen=True,
-                enable_tvm_ffi=True,
-                use_fp16_softmax=True,
-                use_ragged_tma=True,
-                use_dynamic_work_scheduler=dynamic,
-                use_mma_rowsum=True,
-                logical_output=True,
-            )
-            self.assertEqual(
-                name,
-                "cute_dsl_fmha_e4m3_bf16_h72_nocausal_persistent_varlen"
-                f"{suffix}_raggedtma_rowsum_o72_fp16sm_tvmffi",
             )
 
 
