@@ -81,6 +81,8 @@ class TllmGenFmhaKernel {
  public:
   static constexpr int kDynamicNumTokensPerPageThreshold = 128;
   static constexpr int kDynamicNumTokensPerPageKernelKey = 128;
+  // CUDA limit for gridDim.y and gridDim.z.
+  static constexpr int kMaxGridDimYZ = 65535;
 
   // The parameters for launching the kernel.
   // maxNumCtasQ, maxNumCtasKv, numCtasX, numCtasY, numCtasZ, clusterDimX
@@ -472,7 +474,31 @@ class TllmGenFmhaKernel {
       }
     }
 
-    cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
+    // cuLaunchKernelEx rejects a grid beyond the CUDA limits without running the kernel, and
+    // the reduction / LSE kernels below would then consume uninitialized partials. Fail loudly
+    // instead (flashinfer-ai/flashinfer#3125). gridDim.z is the batch size, so a caller that
+    // sends every query token as its own request hits this above 65535 tokens.
+    auto const gridStr = [&ctaLaunchParams] {
+      return std::to_string(ctaLaunchParams.mNumCtasX) + "x" +
+             std::to_string(ctaLaunchParams.mNumCtasY) + "x" +
+             std::to_string(ctaLaunchParams.mNumCtasZ);
+    };
+    if (ctaLaunchParams.mNumCtasY > kMaxGridDimYZ || ctaLaunchParams.mNumCtasZ > kMaxGridDimYZ) {
+      FLASHINFER_ERROR("trtllm-gen FMHA launch grid " + gridStr() + " exceeds the CUDA limit of " +
+                       std::to_string(kMaxGridDimYZ) + " for gridDim.y/z (batch size " +
+                       std::to_string(params.mBatchSize) + ", max query length " +
+                       std::to_string(params.mMaxSeqLenQ) +
+                       "). Split the batch, or pass multi-token requests with cum_seq_lens_q "
+                       "instead of one request per query token.");
+    }
+    CUresult const launchStatus = cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr);
+    if (launchStatus != CUDA_SUCCESS) {
+      char const* errName = nullptr;
+      cuGetErrorName(launchStatus, &errName);
+      FLASHINFER_ERROR(std::string("trtllm-gen FMHA kernel launch failed with ") +
+                       (errName != nullptr ? errName : "an unknown CUDA error") + " (kernel " +
+                       kernelMeta.mFuncName + ", grid " + gridStr() + ")");
+    }
 
     // Run the separate reduction kernel if needed.
     tensorrt_llm::kernels::runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount,
