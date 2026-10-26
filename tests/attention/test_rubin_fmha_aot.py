@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical AOT-only Rubin integration tests.
 
-ViT uses the published artifact pin. Paged and persistent ViT tests require
-locally rebuilt exports (FLASHINFER_DSL_FMHA_LOCAL_DIR) until those are
-published. Missing artifacts fail, never JIT. Tolerances are FP8/FP4 smoke
-gates, not MLPerf accuracy.
+Every export loads from the pinned cute-dsl FMHA collection
+(ArtifactPath.DSL_FMHA), or from FLASHINFER_DSL_FMHA_LOCAL_DIR when it is set.
+Missing artifacts fail; they never JIT and never skip. Tolerances are FP8/FP4
+smoke gates, not MLPerf accuracy.
 """
 
 import math
-import os
 
 import pytest
 import torch
@@ -111,8 +110,6 @@ def test_rubin_vit_d72_d80_aot(padded_graph):
 @pytest.mark.parametrize("mma_rowsum", [False, True])
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_rubin_vit_d72_persistent_aot(dynamic, mma_rowsum):
-    if not os.environ.get("FLASHINFER_DSL_FMHA_LOCAL_DIR"):
-        pytest.skip("Requires locally exported persistent ViT artifacts")
     torch.manual_seed(199)
     # Partial 256-row tiles, empty graph-padding slots and an unused tail.
     lengths = [300, 0, 1024, 17, 0, 0]
@@ -175,8 +172,6 @@ def test_rubin_vit_d72_persistent_aot(dynamic, mma_rowsum):
 @pytest.mark.parametrize("cache_layout", ["combined_hnd", "split_d"])
 @pytest.mark.parametrize("sf_offset", [0, 3, 127])
 def test_rubin_paged_gqa_aot(fp4, output_store, cache_layout, sf_offset):
-    if not os.environ.get("FLASHINFER_DSL_FMHA_LOCAL_DIR"):
-        pytest.skip("Requires rebuilt HND / NVFP4 exporter artifacts")
     torch.manual_seed(199)
     qlens, klens, page = [64, 129], [95, 177], 16
     total, hq, hk, d = sum(qlens), 64, 4, 128
@@ -335,8 +330,6 @@ _TUNED_CASES = {
 @pytest.mark.parametrize("case", list(_TUNED_CASES))
 def test_rubin_paged_gqa_tuned_aot(case, sf_offset, cache_layout):
     """Tuned NVFP4 exports vs fp32, vs the legacy export, and vs offset 0."""
-    if not os.environ.get("FLASHINFER_DSL_FMHA_LOCAL_DIR"):
-        pytest.skip("Requires rebuilt HND / NVFP4 exporter artifacts")
     torch.manual_seed(1999)
     qlens, klens, layout, store = _TUNED_CASES[case]
     total, hq, d = sum(qlens), 64, 128
