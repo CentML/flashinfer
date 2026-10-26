@@ -1543,6 +1543,64 @@ def test_trtllm_batch_decode_mla_sparse_cum_seq_lens_q():
     )
 
 
+@pytest.mark.parametrize("batch_size", [65535, 65536])
+def test_trtllm_batch_decode_mla_sparse_rejects_grid_overflow(batch_size: int):
+    """Issue #3125: the batch maps to gridDim.z, so one request per query token
+    over 65535 tokens used to skip the kernel silently and return garbage."""
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
+    device = "cuda"
+    num_heads, kv_lora_rank, qk_rope_head_dim, topk, page_size = 16, 512, 64, 128, 64
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    query = torch.full(
+        (batch_size, 1, num_heads, head_dim), 0.1, dtype=torch.bfloat16, device=device
+    )
+    kv_cache = torch.randn(
+        topk // page_size, page_size, head_dim, dtype=torch.bfloat16, device=device
+    )
+    sparse_indices = (
+        torch.arange(topk, dtype=torch.int32, device=device)
+        .expand(batch_size, 1, topk)
+        .contiguous()
+    )
+    seq_lens = torch.full((batch_size,), topk, dtype=torch.int32, device=device)
+    workspace_buffer = torch.zeros(workspace_size, dtype=torch.int8, device=device)
+    out = torch.full(
+        (batch_size, 1, num_heads, kv_lora_rank),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    def run():
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache.unsqueeze(1),
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=128,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=sparse_indices,
+            seq_lens=seq_lens,
+            max_seq_len=topk,
+            sparse_mla_top_k=topk,
+            out=out,
+            bmm1_scale=head_dim**-0.5,
+            backend="trtllm-gen",
+        )
+        torch.cuda.synchronize()
+
+    if batch_size > 65535:
+        with pytest.raises(RuntimeError, match="gridDim"):
+            run()
+    else:
+        run()
+        # Every token attends to the same keys with the same query.
+        expected = out[0].expand_as(out)
+        assert not torch.isnan(out).any()
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_mla_native_block_table_width(
     uses_shared_paged_kv_idx: bool,
