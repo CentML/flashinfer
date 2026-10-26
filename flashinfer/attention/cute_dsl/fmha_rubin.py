@@ -17,11 +17,13 @@ These specializations are not implemented by the public FMHA JIT source. A
 missing artifact is an error, not permission to silently compile a different
 kernel. Warm up before CUDA graph capture (or preinstall the cubin wheel).
 
-The pinned MR199 collection supplies D72/D80 ViT and BF16 NHD paged GQA.
-HND, fused NVFP4 output, the multi-sequence ragged page-table fix and the
-persistent ViT variants require new exports. Until those are published, use
-FLASHINFER_DSL_FMHA_LOCAL_DIR with the matching cubin_publishing build; this
-module does not invent a future pin.
+Exports load from the cute-dsl FMHA collection pinned by
+``ArtifactPath.DSL_FMHA`` in ``flashinfer/artifacts.py``. The MR199 collection
+(a10580e7) supplies only D72/D80 ViT and BF16 NHD paged GQA. HND, fused NVFP4
+output, the multi-sequence ragged page-table fix, the tuned paged GQA and the
+persistent ViT variants need a later cubin_publishing collection.
+FLASHINFER_DSL_FMHA_LOCAL_DIR, when set, replaces the pinned collection with a
+directory of exports, for example a build that is not published yet.
 """
 
 import math
@@ -124,11 +126,12 @@ def _load_kernel(q, varlen=True, *, is_persistent=False, **kwargs):
         )
     except (RuntimeError, FileNotFoundError) as exc:
         raise RuntimeError(
-            "The requested Rubin FMHA AOT specialization is unavailable. "
-            "Install matching published artifacts or set FLASHINFER_DSL_FMHA_LOCAL_DIR "
-            "to a matching exporter build. HND/NVFP4 and corrected batched-ragged "
-            "GQA exports are not included in the MR199 artifact pin. "
-            "There is no JIT fallback for this entry point."
+            "The requested Rubin FMHA AOT specialization is unavailable. It must "
+            "be in the pinned cute-dsl FMHA collection (ArtifactPath.DSL_FMHA = "
+            f"{DSL_FMHA_ARTIFACT_PATH!r}) or, when FLASHINFER_DSL_FMHA_LOCAL_DIR "
+            "is set, in that directory. The MR199 collection (a10580e7) has no "
+            "HND/NVFP4, corrected batched-ragged, tuned GQA or persistent ViT "
+            "exports. There is no JIT fallback for this entry point."
         ) from exc
 
 
