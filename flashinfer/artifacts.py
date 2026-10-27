@@ -150,7 +150,7 @@ class ArtifactPath:
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
     DEEPGEMM: str = "7ec7ac40b9fd48172651b77ff2ebe20d79decc39/deep-gemm/"
-    DSL_FMHA: str = "a10580e7fcf79f54c05f5881942562ea70c2765f/fmha/cute-dsl/"
+    DSL_FMHA: str = "96e6da5f40123e53146d8072dfd42f633ad6591a/fmha/cute-dsl/"
     DSL_FMHA_ARCHS: tuple[str, ...] = (
         "sm_100a",
         "sm_103a",
@@ -180,16 +180,16 @@ class CheckSumHash:
     # NOT hashes of individual kernel .so files.
     DSL_FMHA_CHECKSUMS: dict[str, dict[str, str]] = {
         "x86_64": {
-            "sm_100a": "b6f2543a375852633d03a53e527a60f8eb65e441e4ebbc7ea81086d5f67ede14",
-            "sm_103a": "a2ee594b9a8f2eb5d5970de4f126d89c529a2f7c3d041431d940b5d447ab04bf",
-            "sm_107a": "ad5e0c6ed10f938bdd42e6d61952a867ac29173d351431bec0ae9f89ef3ade7b",
-            "sm_110a": "1da3d9be701f4ab421ea6ab8a8ad9330ad9b4ba5a072e813797fcfcdd022383d",
+            "sm_100a": "55afdf9041af190d26fa30e75f702c220f0575da0db2a36b65e21194ca5a4518",
+            "sm_103a": "a0eb1e5633c925a24dace418e6343dc4a86ae1d380461240f6dab676fd61dd2c",
+            "sm_107a": "68f19168fbcf3fce8bed748239e44e04e6903eb1205d10d562f513c8d47ba89d",
+            "sm_110a": "280116944b761cdb514aa63f90ed3d15e353723b220dc9bcd3f7abefc15c7859",
         },
         "aarch64": {
-            "sm_100a": "2f22b82fbd048f176061166e80fe676634345d9501e16cc08ad0781aed9d202d",
-            "sm_103a": "0a6d0a51a414b067df9d1913f02fa8d05b395b81ff20e07a2a46a1e52ac01deb",
-            "sm_107a": "f0df45f467811f76a1f0b3a69957bc013b0ac98d297811117065db291818617d",
-            "sm_110a": "ac5282dbdbd35d8f5762c2cc732a1b2f20154eeabce4c81485f99c21f04a7744",
+            "sm_100a": "770cac77ac207484706b9b10f7304a0b612ef337103f59dd65a00676b921b06b",
+            "sm_103a": "704168c1b77a5a506f4a717de7cc0f1b5f90b8880de7a9a4b8f2bad9b6115ba3",
+            "sm_107a": "10ec195af848107efc576acf179216e8d6bfc00d8894af235b312263ecba96a8",
+            "sm_110a": "a53afea4cd24380b862427111d2e5ef786a14e96e3494d1062436fb9179b9fc2",
         },
     }
     map_checksums: dict[str, str] = {
