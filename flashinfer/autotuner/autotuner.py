@@ -1223,6 +1223,14 @@ class ProfilingCacheKey:
         return str(self.key_fields)
 
 
+def _is_profile(profile: Any) -> bool:
+    """Whether *profile* is a tuple of int tuples, like a ``nearest_profile``."""
+    return isinstance(profile, tuple) and all(
+        isinstance(shape, tuple) and all(type(v) is int for v in shape)
+        for shape in profile
+    )
+
+
 @functools.lru_cache(maxsize=16384)
 def _parse_file_key_profile(text: str) -> tuple[tuple[int, ...], ...] | None:
     """Parse the ``nearest_profile`` part of a ``ProfilingCacheKey.file_key``.
@@ -1235,12 +1243,7 @@ def _parse_file_key_profile(text: str) -> tuple[tuple[int, ...], ...] | None:
         profile = ast.literal_eval(text)
     except (SyntaxError, ValueError, TypeError, RecursionError):
         return None
-    if isinstance(profile, tuple) and all(
-        isinstance(shape, tuple) and all(type(v) is int for v in shape)
-        for shape in profile
-    ):
-        return profile
-    return None
+    return profile if _is_profile(profile) else None
 
 
 @dataclass
@@ -2194,12 +2197,14 @@ class AutoTuner:
         21504 stored as 21504 but looked up as its next power of two, 32768).
         Either way the lookup would silently use the untuned fallback.
 
-        Candidates are the tuned profiles :meth:`search_cache` can serve
-        (the active in-memory partition, user-loaded configs and the
-        hydrated entries of the active managed store) whose op, runner,
-        cache-key extras and non-dynamic dims match this lookup.  Every
-        dynamic dim whose bucket exceeds all candidates is set to the
-        largest candidate value; the others keep their bucket.
+        Candidates are the tuned profiles in the active in-memory partition,
+        the user-loaded configs and the hydrated entries of the active
+        managed store whose op, runner, cache-key extras and non-dynamic dims
+        match this lookup.  The legacy bundled package configs
+        (``FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1``) are looked up by key and
+        are not scanned.  Every dynamic dim whose bucket exceeds all
+        candidates is set to the largest candidate value; the others keep
+        their bucket.
 
         Returns:
             The clamped profile, or ``None`` when no dynamic dim lies above
@@ -2259,6 +2264,7 @@ class AutoTuner:
                 if (root, env_hash) == store_id
                 and len(key_fields) == 4
                 and (key_fields[0], key_fields[1], key_fields[3]) in fields
+                and _is_profile(key_fields[2])
             )
         if not tuned:
             return None
